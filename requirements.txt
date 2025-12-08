@@ -1,5 +1,3 @@
 fastapi
 uvicorn
-cutlet
-fugashi
-unidic-lite
+google-generativeai
