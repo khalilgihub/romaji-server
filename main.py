@@ -4,10 +4,14 @@ import os
 
 app = FastAPI()
 
-# --- 1. SETUP AI ---
-# PASTE YOUR API KEY HERE
-API_KEY = "YOUR_API_KEY_HERE" 
-genai.configure(api_key=API_KEY)
+# --- 1. SETUP AI (SECURELY) ---
+# This reads the key from Render's settings, not the file
+API_KEY = os.environ.get("GEMINI_API_KEY")
+
+if not API_KEY:
+    print("CRITICAL ERROR: GEMINI_API_KEY is missing from Environment Variables!")
+else:
+    genai.configure(api_key=API_KEY)
 
 # Helper to find the right model
 def get_best_model():
@@ -20,12 +24,19 @@ def get_best_model():
     except:
         return 'models/gemini-pro'
 
-MODEL_NAME = get_best_model()
-model = genai.GenerativeModel(MODEL_NAME)
+# Set model (Handle case where API key is missing to prevent crash on startup)
+if API_KEY:
+    MODEL_NAME = get_best_model()
+    model = genai.GenerativeModel(MODEL_NAME)
+else:
+    model = None
 
 # --- 2. THE SERVER ROUTE ---
 @app.get("/convert")
 async def convert_romaji(text: str = ""):
+    if not API_KEY:
+        raise HTTPException(status_code=500, detail="Server Error: API Key not configured.")
+    
     if not text:
         raise HTTPException(status_code=400, detail="No text provided")
 
@@ -42,5 +53,3 @@ async def convert_romaji(text: str = ""):
     except Exception as e:
         print(f"Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-# Note: No app.run() needed here. Uvicorn handles that automatically on Render.
