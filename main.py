@@ -1,53 +1,72 @@
 from fastapi import FastAPI, HTTPException
 import google.generativeai as genai
+import requests
 import os
 
 app = FastAPI()
 
-# --- 1. SETUP AI (SECURELY) ---
-# This line tells Python to look at the Render "Environment" tab for the key
+# --- SETUP AI ---
 API_KEY = os.environ.get("GEMINI_API_KEY")
 
-if not API_KEY:
-    print("CRITICAL ERROR: GEMINI_API_KEY is missing from Environment Variables!")
-    model = None
-else:
+if API_KEY:
     genai.configure(api_key=API_KEY)
-    
-    # Helper to find the right model
-    def get_best_model():
-        try:
-            for m in genai.list_models():
-                if 'generateContent' in m.supported_generation_methods:
-                    if 'flash' in m.name:
-                        return m.name
-            return 'models/gemini-pro'
-        except:
-            return 'models/gemini-pro'
+    # Flash is perfect for handling large blocks of text quickly
+    model = genai.GenerativeModel('gemini-1.5-flash')
+else:
+    model = None
+    print("CRITICAL: No API Key found.")
 
-    MODEL_NAME = get_best_model()
-    model = genai.GenerativeModel(MODEL_NAME)
-    print(f"--- AI INITIALIZED WITH MODEL: {MODEL_NAME} ---")
+# --- HELPER: Search & Download Lyrics ---
+def get_raw_lyrics_from_web(track_name: str, artist_name: str):
+    url = "https://lrclib.net/api/get"
+    params = {"track_name": track_name, "artist_name": artist_name}
+    try:
+        resp = requests.get(url, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        # Prefer synced lyrics, fallback to plain
+        return data.get("syncedLyrics") or data.get("plainLyrics")
+    except Exception as e:
+        print(f"Lyrics Search Error: {e}")
+        return None
 
-# --- 2. THE SERVER ROUTE ---
-@app.get("/convert")
-async def convert_romaji(text: str = ""):
+@app.get("/prepare_song")
+async def prepare_song(song: str, artist: str):
+    """
+    1. Finds the lyrics.
+    2. Converts the WHOLE song to Romaji at once.
+    3. Returns the final ready-to-use data.
+    """
     if not model:
-         raise HTTPException(status_code=500, detail="Server Error: API Key not configured in Render Environment.")
-    
-    if not text:
-        raise HTTPException(status_code=400, detail="No text provided")
+        raise HTTPException(status_code=500, detail="Server AI not configured.")
+
+    # Step 1: Get the Japanese Lyrics
+    raw_lyrics = get_raw_lyrics_from_web(song, artist)
+    if not raw_lyrics:
+        raise HTTPException(status_code=404, detail="Lyrics not found on LRCLIB.")
+
+    # Step 2: Ask AI to convert the whole block
+    # We ask it to KEEP the timestamps [00:12.34] but change the text
+    prompt = (
+        f"I will give you lyrics with timestamps. "
+        f"Convert the Japanese text to Romaji (Hepburn). "
+        f"KEEP the timestamps exactly as they are. "
+        f"Do NOT output the original Japanese. Only the Romaji lines. "
+        f"\n\nLyrics:\n{raw_lyrics}"
+    )
 
     try:
-        # Ask AI to convert
-        prompt = f"Convert this Japanese text to Romaji. Return ONLY the Romaji. Text: {text}"
-        response = model.generate_content(prompt)
+        print(f"--- Processing entire song: {song} ---")
+        response = await model.generate_content_async(prompt)
+        converted_lyrics = response.text.strip()
         
         return {
-            "original": text,
-            "romaji": response.text.strip()
+            "status": "ready",
+            "song": song,
+            "artist": artist,
+            "lyrics": converted_lyrics # The app just displays this directly!
         }
 
     except Exception as e:
-        print(f"Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"AI Batch Error: {e}")
+        return {"error": str(e), "lyrics": raw_lyrics} # Fallback to raw if AI fails
