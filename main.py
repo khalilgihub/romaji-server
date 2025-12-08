@@ -1,49 +1,54 @@
-from fastapi import FastAPI
-import google.generativeai as genai
 import os
+import google.generativeai as genai
+from flask import Flask, request, jsonify
 
-app = FastAPI()
+app = Flask(__name__)
 
-# --- SECURE SETUP ---
-# We get the key from the Server's Environment Variables
-# This keeps it hidden from hackers.
-API_KEY = os.environ.get("GEMINI_API_KEY")
+# --- CONFIGURATION ---
+# Replace this with your actual API Key
+API_KEY = "YOUR_API_KEY_HERE"
+genai.configure(api_key=API_KEY)
 
-if not API_KEY:
-    print("Error: No API Key found in Environment Variables!")
-else:
-    genai.configure(api_key=API_KEY)
-    model = genai.GenerativeModel('gemini-1.5-flash')
-
-@app.get("/")
-def home():
-    return {"status": "AI Server Online"}
-
-@app.get("/convert")
-def convert_lyrics(text: str = ""):
-    if not text:
-        return {"original": "", "romaji": ""}
-    
+# Function to find the best available model automatically
+def get_best_model():
     try:
-        if not API_KEY:
-            return {"original": text, "romaji": text} # Fail safely if key is missing
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                if 'flash' in m.name:
+                    return m.name
+        return 'models/gemini-pro' # Fallback if flash isn't found
+    except:
+        return 'models/gemini-pro'
 
-        prompt = f"""
-        Convert this Japanese song lyric to Hepburn Romaji.
-        Rules:
-        1. Look for poetic readings (Gikun). Example: Read '現在' as 'ima' if it fits the context.
-        2. Fix spacing issues. Combine verbs properly (e.g., 'kasanete', NOT 'kasane te').
-        3. Output ONLY the romaji text. No explanations.
-        
-        Lyric: {text}
-        """
+# Set the model once at startup
+MODEL_NAME = get_best_model()
+print(f"--- USING AI MODEL: {MODEL_NAME} ---")
+
+model = genai.GenerativeModel(MODEL_NAME)
+
+@app.route('/convert', methods=['GET'])
+def convert_to_romaji():
+    text = request.args.get('text')
+    if not text:
+        return jsonify({"error": "No text provided"}), 400
+
+    try:
+        # We tell the AI strictly what to do to avoid extra talking
+        prompt = f"Convert this Japanese text to Romaji. Return ONLY the Romaji. Text: {text}"
         
         response = model.generate_content(prompt)
-        romaji = response.text.strip()
-        romaji = " ".join(romaji.split())
-
-        return {"original": text, "romaji": romaji}
+        
+        # .text gives the result
+        romaji_text = response.text.strip()
+        
+        return jsonify({
+            "original": text,
+            "romaji": romaji_text
+        })
 
     except Exception as e:
-        print(f"Error: {e}")
-        return {"original": text, "romaji": text}
+        print(f"AI Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
