@@ -1,54 +1,46 @@
-import os
+from fastapi import FastAPI, HTTPException
 import google.generativeai as genai
-from flask import Flask, request, jsonify
+import os
 
-app = Flask(__name__)
+app = FastAPI()
 
-# --- CONFIGURATION ---
-# Replace this with your actual API Key
-API_KEY = "YOUR_API_KEY_HERE"
+# --- 1. SETUP AI ---
+# PASTE YOUR API KEY HERE
+API_KEY = "YOUR_API_KEY_HERE" 
 genai.configure(api_key=API_KEY)
 
-# Function to find the best available model automatically
+# Helper to find the right model
 def get_best_model():
     try:
         for m in genai.list_models():
             if 'generateContent' in m.supported_generation_methods:
                 if 'flash' in m.name:
                     return m.name
-        return 'models/gemini-pro' # Fallback if flash isn't found
+        return 'models/gemini-pro'
     except:
         return 'models/gemini-pro'
 
-# Set the model once at startup
 MODEL_NAME = get_best_model()
-print(f"--- USING AI MODEL: {MODEL_NAME} ---")
-
 model = genai.GenerativeModel(MODEL_NAME)
 
-@app.route('/convert', methods=['GET'])
-def convert_to_romaji():
-    text = request.args.get('text')
+# --- 2. THE SERVER ROUTE ---
+@app.get("/convert")
+async def convert_romaji(text: str = ""):
     if not text:
-        return jsonify({"error": "No text provided"}), 400
+        raise HTTPException(status_code=400, detail="No text provided")
 
     try:
-        # We tell the AI strictly what to do to avoid extra talking
+        # Ask AI to convert
         prompt = f"Convert this Japanese text to Romaji. Return ONLY the Romaji. Text: {text}"
-        
         response = model.generate_content(prompt)
         
-        # .text gives the result
-        romaji_text = response.text.strip()
-        
-        return jsonify({
+        return {
             "original": text,
-            "romaji": romaji_text
-        })
+            "romaji": response.text.strip()
+        }
 
     except Exception as e:
-        print(f"AI Error: {e}")
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+# Note: No app.run() needed here. Uvicorn handles that automatically on Render.
