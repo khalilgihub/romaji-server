@@ -4,12 +4,16 @@ import os
 
 app = FastAPI()
 
-# --- SETUP ---
-# Your Google API Key
-API_KEY = "AIzaSyBXPO9hlH1ueZ_UOOpHtElLVrMCa75zV9w"
+# --- SECURE SETUP ---
+# We get the key from the Server's Environment Variables
+# This keeps it hidden from hackers.
+API_KEY = os.environ.get("GEMINI_API_KEY")
 
-genai.configure(api_key=API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
+if not API_KEY:
+    print("Error: No API Key found in Environment Variables!")
+else:
+    genai.configure(api_key=API_KEY)
+    model = genai.GenerativeModel('gemini-1.5-flash')
 
 @app.get("/")
 def home():
@@ -21,7 +25,9 @@ def convert_lyrics(text: str = ""):
         return {"original": "", "romaji": ""}
     
     try:
-        # We ask Gemini to act like a professional lyricist
+        if not API_KEY:
+            return {"original": text, "romaji": text} # Fail safely if key is missing
+
         prompt = f"""
         Convert this Japanese song lyric to Hepburn Romaji.
         Rules:
@@ -34,13 +40,10 @@ def convert_lyrics(text: str = ""):
         
         response = model.generate_content(prompt)
         romaji = response.text.strip()
-        
-        # Clean up any extra whitespace or newlines
         romaji = " ".join(romaji.split())
 
         return {"original": text, "romaji": romaji}
 
     except Exception as e:
         print(f"Error: {e}")
-        # If AI fails (rare), return original text so app doesn't crash
         return {"original": text, "romaji": text}
