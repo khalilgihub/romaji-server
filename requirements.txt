@@ -1,5 +1,6 @@
 fastapi
 uvicorn
-openai
 requests
 redis
+groq
+openai
