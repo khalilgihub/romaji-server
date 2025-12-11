@@ -4,3 +4,4 @@ requests
 redis
 openai
 beautifulsoup4
+jaconv
