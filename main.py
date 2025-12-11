@@ -5,12 +5,11 @@ import os
 import re
 import hashlib
 import unicodedata
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 import json
 import redis
 from bs4 import BeautifulSoup
 import asyncio
-import aiohttp
 from concurrent.futures import ThreadPoolExecutor
 import time
 from fastapi.responses import StreamingResponse
@@ -36,13 +35,15 @@ def setup_systems():
         try:
             client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
             print(f"✅ DeepSeek AI Online: {DEEPSEEK_MODEL}")
-        except: pass
+        except Exception as e:
+            print(f"❌ DeepSeek AI Failed: {e}")
     if REDIS_URL:
         try:
             redis_client = redis.from_url(REDIS_URL, decode_responses=True)
             redis_client.ping()
             print("✅ Redis Online")
-        except: pass
+        except Exception as e:
+            print(f"❌ Redis Failed: {e}")
     if GENIUS_API_TOKEN:
         print("✅ Genius API Token Loaded")
 
@@ -56,7 +57,7 @@ def normalize_text(text: str) -> str:
     text = re.sub(r'[!?.,;:]', '', text)  # Remove punctuation
     return text.strip()
 
-# --- 1. FETCH TIMESTAMPS (LRCLib) ---
+# --- 1. FETCH TIMESTAMPS (LRCLib) - OPTIMIZED ---
 def parse_lrc_lines(lrc_text: str) -> List[Dict]:
     """Parse LRC text into structured lines"""
     lines = []
@@ -72,38 +73,61 @@ def parse_lrc_lines(lrc_text: str) -> List[Dict]:
     return lines
 
 async def fetch_lrc_timestamps(song: str, artist: str) -> Optional[List[Dict]]:
+    """Fetch LRC timestamps with better error handling"""
     try:
         url = "https://lrclib.net/api/get"
+        params = {
+            "track_name": song, 
+            "artist_name": artist,
+            "duration": ""  # Helps with matching
+        }
+        
         loop = asyncio.get_event_loop()
         resp = await loop.run_in_executor(
             None, 
-            lambda: requests.get(
-                url, 
-                params={"track_name": song, "artist_name": artist}, 
-                timeout=5
-            )
+            lambda: requests.get(url, params=params, timeout=5)
         )
-        data = resp.json()
-        lrc_text = data.get("syncedLyrics")
-        if not lrc_text: 
-            return None
         
-        return parse_lrc_lines(lrc_text)
-    except: 
+        if resp.status_code == 200:
+            data = resp.json()
+            lrc_text = data.get("syncedLyrics")
+            if not lrc_text:
+                # Try unsynchronized lyrics as fallback
+                lrc_text = data.get("plainLyrics")
+                if lrc_text:
+                    # Create artificial timestamps for unsynced lyrics
+                    lines = []
+                    for i, line in enumerate(lrc_text.split('\n')):
+                        if line.strip():
+                            # Create timestamp based on line number (approx 3 sec per line)
+                            minutes = (i * 3) // 60
+                            seconds = (i * 3) % 60
+                            timestamp = f"[{minutes:02d}:{seconds:02d}.00]"
+                            lines.append({
+                                'timestamp': timestamp,
+                                'reference': line.strip()
+                            })
+                    return lines
+                return None
+            
+            return parse_lrc_lines(lrc_text)
+        return None
+    except Exception as e:
+        print(f"LRC fetch error: {e}")
         return None
 
 # --- 2. IMPROVED GENIUS FETCHER ---
-async def fetch_genius_lyrics_parallel(song: str, artist: str) -> Optional[str]:
-    """Get structured romaji lyrics from Genius"""
+async def fetch_genius_lyrics(song: str, artist: str) -> Optional[Tuple[str, str]]:
+    """Get structured romaji lyrics from Genius, returns (lyrics, url)"""
     if not GENIUS_API_TOKEN: 
         return None
     
     try:
         headers = {"Authorization": f"Bearer {GENIUS_API_TOKEN}"}
-        loop = asyncio.get_event_loop()
         
         # Search for song
-        search_query = f"{song} {artist} romaji"
+        search_query = f"{song} {artist}"
+        loop = asyncio.get_event_loop()
         resp = await loop.run_in_executor(
             None, 
             lambda: requests.get(
@@ -118,7 +142,20 @@ async def fetch_genius_lyrics_parallel(song: str, artist: str) -> Optional[str]:
         if not data['response']['hits']:
             return None
         
-        song_url = data['response']['hits'][0]['result']['url']
+        # Try to find the best match
+        best_hit = None
+        for hit in data['response']['hits']:
+            result = hit['result']
+            # Check if artist matches reasonably well
+            if artist.lower() in result['primary_artist']['name'].lower() or \
+               result['primary_artist']['name'].lower() in artist.lower():
+                best_hit = result
+                break
+        
+        if not best_hit:
+            best_hit = data['response']['hits'][0]['result']
+        
+        song_url = best_hit['url']
         
         # Fetch and parse page
         page = await loop.run_in_executor(
@@ -134,240 +171,307 @@ async def fetch_genius_lyrics_parallel(song: str, artist: str) -> Optional[str]:
         )
         soup = BeautifulSoup(page.text, 'html.parser')
         
-        # Extract structured lyrics
-        lyrics_divs = soup.find_all('div', {'data-lyrics-container': 'true'})
-        full_text = []
+        # Look for Romaji specifically
+        romaji_sections = []
         
-        for div in lyrics_divs:
-            for el in div.descendants:
-                if el.name == 'br':
-                    full_text.append('\n')
-                elif isinstance(el, str):
-                    t = el.strip()
-                    if t and not t.startswith('[') and not t.endswith(']'):
-                        full_text.append(t)
+        # Method 1: Try to find Romaji sections
+        for div in soup.find_all('div', class_=re.compile(r'.*romaji.*', re.I)):
+            if 'romaji' in div.get('class', ''):
+                text = div.get_text(separator='\n', strip=True)
+                romaji_sections.append(text)
         
-        text = ''.join(full_text)
+        # Method 2: Check all lyrics containers
+        if not romaji_sections:
+            lyrics_divs = soup.find_all('div', {'data-lyrics-container': 'true'})
+            for div in lyrics_divs:
+                text = div.get_text(separator='\n', strip=True)
+                # Check if this looks like Romaji (mostly Latin characters)
+                jp_chars = len(re.findall(r'[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]', text))
+                latin_chars = len(re.findall(r'[a-zA-Z]', text))
+                
+                if latin_chars > jp_chars * 2:  # Mostly Latin
+                    romaji_sections.append(text)
         
-        # Better validation: Check for Romaji patterns
-        romaji_pattern = r'\b[a-zA-ZāēīōūĀĒĪŌŪ]+[a-zA-ZāēīōūĀĒĪŌŪ\s]*\b'
-        romaji_count = len(re.findall(romaji_pattern, text))
-        total_words = len(text.split())
+        # Method 3: If still no Romaji, take the first lyrics container
+        if not romaji_sections and lyrics_divs:
+            text = lyrics_divs[0].get_text(separator='\n', strip=True)
+            romaji_sections.append(text)
         
-        if total_words > 0 and romaji_count / total_words < 0.5:
-            return None  # Not enough Romaji
+        if not romaji_sections:
+            return None
         
-        return text
+        romaji_text = '\n\n'.join(romaji_sections)
+        
+        # Clean up the text
+        romaji_text = re.sub(r'\[.*?\]', '', romaji_text)  # Remove bracketed sections
+        romaji_text = re.sub(r'\n\s*\n', '\n', romaji_text)  # Remove empty lines
+        romaji_text = romaji_text.strip()
+        
+        return romaji_text, song_url
+        
     except Exception as e:
         print(f"Genius fetch error: {e}")
         return None
 
-# --- 3. SMART MATCHING ALGORITHM ---
-def find_best_match(japanese_line: str, romaji_candidates: List[str]) -> Optional[str]:
-    """Find the best romaji match for a Japanese line"""
-    normalized_jp = normalize_text(japanese_line)
-    best_score = 0
-    best_match = None
+# --- 3. ADVANCED MATCHING ALGORITHM ---
+def calculate_similarity(text1: str, text2: str) -> float:
+    """Calculate similarity between two texts using multiple metrics"""
+    # Normalize texts
+    norm1 = normalize_text(text1)
+    norm2 = normalize_text(text2)
     
-    for romaji in romaji_candidates:
-        normalized_romaji = normalize_text(romaji)
-        
-        # Check for direct word overlap
-        jp_words = set(normalized_jp.split())
-        romaji_words = set(normalized_romaji.split())
-        overlap = len(jp_words & romaji_words) / max(len(jp_words), 1)
-        
-        if overlap > 0.3:  # If they share words
-            score = SequenceMatcher(None, normalized_jp, normalized_romaji).ratio()
-            if score > best_score:
-                best_score = score
-                best_match = romaji
+    # 1. Sequence matcher ratio
+    seq_ratio = SequenceMatcher(None, norm1, norm2).ratio()
     
-    return best_match if best_score > 0.4 else None
+    # 2. Word overlap ratio
+    words1 = set(norm1.split())
+    words2 = set(norm2.split())
+    if words1 or words2:
+        word_ratio = len(words1 & words2) / max(len(words1), len(words2))
+    else:
+        word_ratio = 0
+    
+    # 3. Character n-gram similarity (for partial matches)
+    def get_ngrams(text, n=3):
+        return [text[i:i+n] for i in range(len(text)-n+1)]
+    
+    ngrams1 = set(get_ngrams(norm1))
+    ngrams2 = set(get_ngrams(norm2))
+    if ngrams1 or ngrams2:
+        ngram_ratio = len(ngrams1 & ngrams2) / max(len(ngrams1), len(ngrams2))
+    else:
+        ngram_ratio = 0
+    
+    # Weighted combination
+    return 0.4 * seq_ratio + 0.4 * word_ratio + 0.2 * ngram_ratio
 
-async def smart_align_lyrics(lrc_lines: List[Dict], romaji_text: str) -> List[str]:
-    """Intelligently align Japanese timestamps with Romaji lines"""
+async def advanced_align_lyrics(lrc_lines: List[Dict], romaji_text: str) -> List[str]:
+    """Advanced alignment using multiple strategies"""
     
     # Clean and split romaji text
     romaji_lines = []
     for line in romaji_text.split('\n'):
         line = line.strip()
-        if line and not re.match(r'^[0-9]+\.[0-9]+$', line):  # Skip timestamps
+        if line and not re.match(r'^[0-9\.]+$', line):  # Skip timestamps and numbers
             romaji_lines.append(line)
     
-    # Matching algorithm
-    romaji_index = 0
-    aligned_result = []
+    if not romaji_lines:
+        return []
     
-    for i, lrc_line in enumerate(lrc_lines):
-        japanese_text = lrc_line['reference']
+    # Strategy 1: Try to match line by line with dynamic window
+    aligned = []
+    romaji_idx = 0
+    max_skip = 3  # Allow skipping up to 3 romaji lines
+    
+    for lrc_idx, lrc_line in enumerate(lrc_lines):
+        japanese = lrc_line['reference']
+        best_score = 0
+        best_match_idx = -1
+        best_match_text = ""
         
-        # Look ahead in romaji (sliding window)
-        window_size = min(5, len(romaji_lines) - romaji_index)
-        candidates = []
+        # Search in a window around current position
+        search_start = max(0, romaji_idx - max_skip)
+        search_end = min(len(romaji_lines), romaji_idx + max_skip + 1)
         
-        for j in range(romaji_index, min(romaji_index + window_size, len(romaji_lines))):
-            candidates.append(romaji_lines[j])
+        for i in range(search_start, search_end):
+            similarity = calculate_similarity(japanese, romaji_lines[i])
+            if similarity > best_score and similarity > 0.3:
+                best_score = similarity
+                best_match_idx = i
+                best_match_text = romaji_lines[i]
         
-        if candidates:
-            best_match = find_best_match(japanese_text, candidates)
-            
-            if best_match:
-                # Move romaji index to after the matched line
-                for j in range(romaji_index, len(romaji_lines)):
-                    if romaji_lines[j] == best_match:
-                        romaji_index = j + 1
-                        break
-                aligned_result.append(f"{lrc_line['timestamp']} {best_match}")
-                continue
-        
-        # No match found in window, try broader search
-        if romaji_index < len(romaji_lines):
-            aligned_result.append(f"{lrc_line['timestamp']} {romaji_lines[romaji_index]}")
-            romaji_index += 1
+        if best_match_idx >= 0:
+            aligned.append(f"{lrc_line['timestamp']} {best_match_text}")
+            romaji_idx = best_match_idx + 1
         else:
-            # Fallback to translation
-            aligned_result.append(f"{lrc_line['timestamp']} {japanese_text}")
+            # No good match found, use current line and advance
+            if romaji_idx < len(romaji_lines):
+                aligned.append(f"{lrc_line['timestamp']} {romaji_lines[romaji_idx]}")
+                romaji_idx += 1
+            else:
+                # Out of romaji lines, use Japanese
+                aligned.append(f"{lrc_line['timestamp']} {japanese}")
     
-    return aligned_result
+    # Strategy 2: If alignment seems poor, try AI alignment
+    japanese_count = sum(1 for line in aligned if re.search(r'[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]', line))
+    if japanese_count > len(aligned) * 0.3:  # More than 30% Japanese
+        print("⚠️ Poor alignment detected, trying AI correction...")
+        try:
+            ai_aligned = await ai_correct_alignment(lrc_lines, romaji_text, aligned)
+            if ai_aligned:
+                return ai_aligned
+        except:
+            pass
+    
+    return aligned
 
-# --- 4. BATCH TRANSLATION (FASTER) ---
-async def translate_line(text: str) -> str:
-    """Translate a single line quickly"""
-    prompt = f"Translate this Japanese to Romaji (Hepburn). Only output the romaji: {text}"
-    completion = await client.chat.completions.create(
-        messages=[{"role": "user", "content": prompt}],
-        model=DEEPSEEK_MODEL,
-        temperature=0,
-        max_tokens=50
-    )
-    return completion.choices[0].message.content.strip()
+async def ai_correct_alignment(lrc_lines: List[Dict], romaji_text: str, current_alignment: List[str]) -> Optional[List[str]]:
+    """Use AI to correct poor alignment"""
+    if not client:
+        return None
+    
+    prompt = f"""Fix this lyrics alignment. I have {len(lrc_lines)} Japanese lines with timestamps, 
+    and Romaji lyrics. Current alignment has issues. Please provide better alignment.
 
+    JAPANESE LINES WITH TIMESTAMPS:
+    {json.dumps([f"{l['timestamp']} {l['reference']}" for l in lrc_lines[:30]], ensure_ascii=False)}
+
+    ROMAJI LYRICS:
+    {romaji_text[:2000]}
+
+    CURRENT (FLAWED) ALIGNMENT:
+    {json.dumps(current_alignment[:30], ensure_ascii=False)}
+
+    RULES:
+    1. Output EXACTLY {len(lrc_lines)} lines
+    2. Each line must start with the EXACT timestamp from Japanese lines
+    3. Map Romaji to Japanese as accurately as possible
+    4. If unsure, translate Japanese to Romaji
+    5. Output format: ["[00:00.00] Romaji text", ...]
+
+    OUTPUT JSON: {{"aligned": ["line1", "line2", ...]}}"""
+    
+    try:
+        completion = await client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model=DEEPSEEK_MODEL,
+            temperature=0.1,
+            response_format={"type": "json_object"}
+        )
+        data = json.loads(completion.choices[0].message.content)
+        return data.get("aligned", [])
+    except:
+        return None
+
+# --- 4. BATCH TRANSLATION (OPTIMIZED) ---
 async def batch_translate_lines(japanese_lines: List[str]) -> List[str]:
     """Translate multiple lines at once for efficiency"""
     if not client or not japanese_lines:
         return japanese_lines
     
     # Group lines for efficient processing
-    batch_size = 20
+    batch_size = 30
     results = []
     
     for i in range(0, len(japanese_lines), batch_size):
         batch = japanese_lines[i:i+batch_size]
-        prompt = f"""Translate these Japanese lines to Romaji (Hepburn).
-        Output as a JSON array with exactly {len(batch)} strings.
+        prompt = f"""Translate these Japanese lyrics to Romaji (Hepburn romanization).
         
-        Lines: {json.dumps(batch, ensure_ascii=False)}
+        IMPORTANT:
+        1. Preserve the original meaning and poetic flow
+        2. Maintain line breaks exactly (output same number of lines)
+        3. Use proper romanization with long vowels (ō, ū, etc.)
+        4. Keep song structure (verse, chorus markers if present)
         
-        Output format: {{"translations": ["romaji1", "romaji2", ...]}}"""
+        LINES TO TRANSLATE ({len(batch)} lines):
+        {json.dumps(batch, ensure_ascii=False)}
+        
+        Output JSON: {{"translations": ["romaji line 1", "romaji line 2", ...]}}"""
         
         try:
             completion = await client.chat.completions.create(
                 messages=[{"role": "user", "content": prompt}],
                 model=DEEPSEEK_MODEL,
-                temperature=0,
+                temperature=0.3,
                 response_format={"type": "json_object"}
             )
             data = json.loads(completion.choices[0].message.content)
-            results.extend(data.get("translations", batch))
-        except:
-            results.extend(batch)  # Fallback
+            translations = data.get("translations", [])
+            
+            # Ensure we have the right number of translations
+            if len(translations) == len(batch):
+                results.extend(translations)
+            else:
+                # Fallback: translate individually
+                for line in batch:
+                    try:
+                        trans = await translate_line_simple(line)
+                        results.append(trans)
+                    except:
+                        results.append(line)
+        except Exception as e:
+            print(f"Batch translation error: {e}")
+            # Fallback to original text
+            results.extend(batch)
     
     return results
 
-# --- 5. MAIN PROCESSING (OPTIMIZED) ---
+async def translate_line_simple(text: str) -> str:
+    """Simple single line translation"""
+    prompt = f"Translate to Romaji (Hepburn): {text}"
+    completion = await client.chat.completions.create(
+        messages=[{"role": "user", "content": prompt}],
+        model=DEEPSEEK_MODEL,
+        temperature=0.1,
+        max_tokens=100
+    )
+    return completion.choices[0].message.content.strip()
+
+# --- 5. MAIN PROCESSING (COMPLETE REWORK) ---
 async def process_song(song: str, artist: str):
-    cache_key = f"hybrid:{song.lower()}:{artist.lower()}"
+    """Main processing pipeline with fallback strategies"""
+    cache_key = f"song:{hashlib.md5(f'{song.lower()}:{artist.lower()}'.encode()).hexdigest()}"
     
-    if cache_key in song_cache: 
+    # Check cache
+    if cache_key in song_cache:
         return song_cache[cache_key]
+    
     if redis_client:
         cached = redis_client.get(cache_key)
-        if cached: 
-            song_cache[cache_key] = json.loads(cached)
-            return song_cache[cache_key]
+        if cached:
+            result = json.loads(cached)
+            song_cache[cache_key] = result
+            return result
 
-    print(f"🚀 Processing: {song}...")
+    print(f"🚀 Processing: {song} by {artist}...")
     start_time = time.time()
     
-    # Parallel fetch
-    loop = asyncio.get_event_loop()
-    
-    # Fetch LRC and Genius in parallel
-    lrc_future = loop.run_in_executor(
-        executor, 
-        lambda: requests.get(
-            "https://lrclib.net/api/get",
-            params={"track_name": song, "artist_name": artist},
-            timeout=5
-        )
-    )
-    
-    genius_future = None
-    if GENIUS_API_TOKEN:
-        genius_future = loop.run_in_executor(
-            executor,
-            lambda: requests.get(
-                f"https://api.genius.com/search?q={song} {artist} romaji",
-                headers={"Authorization": f"Bearer {GENIUS_API_TOKEN}"},
-                timeout=5
-            )
-        )
-    
-    # Wait for LRC first
     try:
-        lrc_response = await asyncio.wait_for(lrc_future, timeout=5)
-        lrc_data = lrc_response.json()
-        lrc_text = lrc_data.get("syncedLyrics")
+        # STEP 1: Fetch LRC timestamps (primary source)
+        lrc_lines = await fetch_lrc_timestamps(song, artist)
+        if not lrc_lines:
+            raise HTTPException(404, "No lyrics found on LRCLib")
         
-        if not lrc_text:
-            raise HTTPException(404, "No lyrics found")
+        print(f"📊 Found {len(lrc_lines)} timed lines")
         
-        # Parse LRC lines
-        lrc_lines = parse_lrc_lines(lrc_text)
-        
-        # Get Genius result if available
+        # STEP 2: Try to fetch Genius Romaji
+        genius_result = await fetch_genius_lyrics(song, artist)
         romaji_text = None
-        if genius_future:
-            try:
-                genius_response = await asyncio.wait_for(genius_future, timeout=5)
-                genius_data = genius_response.json()
-                
-                if genius_data['response']['hits']:
-                    song_url = genius_data['response']['hits'][0]['result']['url']
-                    page = requests.get(song_url, headers={'User-Agent': 'Mozilla/5.0'})
-                    soup = BeautifulSoup(page.text, 'html.parser')
-                    lyrics_divs = soup.find_all('div', {'data-lyrics-container': 'true'})
-                    
-                    full_text = []
-                    for div in lyrics_divs:
-                        text = div.get_text(separator='\n', strip=True)
-                        full_text.append(text)
-                    
-                    romaji_text = '\n'.join(full_text)
-            except:
-                pass  # Genius is optional
         
-        # Process alignment
+        if genius_result:
+            romaji_text, genius_url = genius_result
+            print(f"🎵 Found Genius Romaji ({len(romaji_text)} chars)")
+        
+        # STEP 3: Process alignment
         final_lyrics = []
         source = ""
+        processing_details = []
         
         if romaji_text:
-            print("✨ Found Genius Romaji! Aligning...")
-            final_lyrics = await smart_align_lyrics(lrc_lines, romaji_text)
+            # Strategy A: Advanced alignment
+            aligned = await advanced_align_lyrics(lrc_lines, romaji_text)
             
-            if final_lyrics and len(final_lyrics) == len(lrc_lines):
-                source = "Genius + Smart Align"
+            # Check alignment quality
+            japanese_count = sum(1 for line in aligned if re.search(r'[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]', line))
+            alignment_ratio = 1 - (japanese_count / len(aligned)) if aligned else 0
+            
+            if alignment_ratio > 0.7 and len(aligned) == len(lrc_lines):
+                final_lyrics = aligned
+                source = "Genius + Advanced Align"
+                processing_details.append(f"Alignment quality: {alignment_ratio:.1%}")
             else:
-                # Fallback to translation
+                # Strategy B: Translate everything
+                print("🔄 Alignment poor, translating all lines...")
                 translated = await batch_translate_lines([l['reference'] for l in lrc_lines])
                 final_lyrics = [
                     f"{lrc_lines[i]['timestamp']} {translated[i]}" 
                     for i in range(len(lrc_lines))
                 ]
                 source = "AI Translation (Fallback)"
+                processing_details.append(f"Alignment poor ({alignment_ratio:.1%}), used translation")
         else:
-            print("🤖 No Genius Romaji found. Translating...")
+            # No Genius, translate everything
+            print("🔤 No Genius Romaji found, translating...")
             translated = await batch_translate_lines([l['reference'] for l in lrc_lines])
             final_lyrics = [
                 f"{lrc_lines[i]['timestamp']} {translated[i]}" 
@@ -375,117 +479,197 @@ async def process_song(song: str, artist: str):
             ]
             source = "AI Translation"
         
+        # Ensure we have the right number of lines
+        if len(final_lyrics) != len(lrc_lines):
+            print(f"⚠️ Line count mismatch ({len(final_lyrics)} vs {len(lrc_lines)}), adjusting...")
+            # Pad or truncate to match
+            if len(final_lyrics) < len(lrc_lines):
+                for i in range(len(final_lyrics), len(lrc_lines)):
+                    final_lyrics.append(f"{lrc_lines[i]['timestamp']} {lrc_lines[i]['reference']}")
+            else:
+                final_lyrics = final_lyrics[:len(lrc_lines)]
+        
+        # Create result
         result = {
             "lyrics": '\n'.join(final_lyrics),
             "song": song,
             "artist": artist,
             "source": source,
             "line_count": len(final_lyrics),
-            "processing_time": round(time.time() - start_time, 2)
+            "processing_time": round(time.time() - start_time, 2),
+            "details": processing_details,
+            "cached": False
         }
         
-        # Cache
+        # Cache the result
         song_cache[cache_key] = result
-        if redis_client: 
-            redis_client.setex(cache_key, 86400, json.dumps(result))  # 1 day cache
+        if redis_client:
+            redis_client.setex(cache_key, 604800, json.dumps(result))  # 7 days cache
         
+        print(f"✅ Completed in {result['processing_time']}s via {source}")
         return result
         
-    except asyncio.TimeoutError:
-        raise HTTPException(504, "Timeout fetching lyrics")
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Error: {e}")
-        raise HTTPException(500, "Processing failed")
+        print(f"❌ Processing error: {e}")
+        raise HTTPException(500, f"Processing failed: {str(e)}")
 
 # --- 6. STREAMING ENDPOINT (REAL-TIME) ---
 @app.get("/stream_song")
 async def stream_song(song: str, artist: str):
-    """Stream lyrics as they become available (for real-time display)"""
+    """Stream lyrics as they become available"""
     async def generate():
-        # Send initial metadata
-        yield json.dumps({"status": "started", "song": song, "artist": artist}) + "\n"
+        cache_key = f"stream:{hashlib.md5(f'{song.lower()}:{artist.lower()}'.encode()).hexdigest()}"
         
-        # Get timestamps first (fast)
-        lrc_data = await fetch_lrc_timestamps(song, artist)
-        if not lrc_data:
-            yield json.dumps({"error": "No timestamps found"}) + "\n"
-            return
+        # Check cache first
+        cached_result = None
+        if redis_client:
+            cached = redis_client.get(cache_key)
+            if cached:
+                cached_result = json.loads(cached)
         
-        yield json.dumps({
-            "status": "timestamps_loaded", 
-            "count": len(lrc_data),
-            "progress": 0.2
-        }) + "\n"
-        
-        # Start Genius fetch in background
-        genius_task = asyncio.create_task(fetch_genius_lyrics_parallel(song, artist))
-        
-        # Send first few translated lines immediately (for instant display)
-        first_lines = lrc_data[:15]
-        translated = await batch_translate_lines([l['reference'] for l in first_lines])
-        
-        for i in range(len(first_lines)):
+        if cached_result:
+            # Send cached result quickly
             yield json.dumps({
-                "line": f"{first_lines[i]['timestamp']} {translated[i]}",
-                "index": i,
-                "total": len(lrc_data),
-                "progress": 0.3 + (i / len(lrc_data) * 0.3)
+                "status": "cached",
+                "song": song,
+                "artist": artist,
+                "progress": 1.0
             }) + "\n"
-        
-        # Wait for Genius
-        romaji_text = await genius_task
-        
-        if romaji_text:
-            # Align and send the rest
-            yield json.dumps({"status": "genius_loaded", "aligning": True, "progress": 0.6}) + "\n"
             
-            aligned = await smart_align_lyrics(lrc_data[15:], romaji_text)
-            for i, line in enumerate(aligned, start=15):
+            lines = cached_result.get("lyrics", "").split('\n')
+            for i, line in enumerate(lines):
                 yield json.dumps({
                     "line": line,
                     "index": i,
-                    "total": len(lrc_data),
-                    "progress": 0.6 + (i / len(lrc_data) * 0.4)
+                    "total": len(lines),
+                    "progress": (i + 1) / len(lines)
                 }) + "\n"
-        else:
-            # Continue with translation
-            remaining = lrc_data[15:]
-            translated = await batch_translate_lines([l['reference'] for l in remaining])
             
+            yield json.dumps({
+                "status": "complete",
+                "source": cached_result.get("source", "cache"),
+                "cached": True
+            }) + "\n"
+            return
+        
+        # Not cached, process in real-time
+        yield json.dumps({
+            "status": "started", 
+            "song": song, 
+            "artist": artist,
+            "progress": 0.1
+        }) + "\n"
+        
+        # Fetch LRC first
+        lrc_lines = await fetch_lrc_timestamps(song, artist)
+        if not lrc_lines:
+            yield json.dumps({"error": "No lyrics found"}) + "\n"
+            return
+        
+        yield json.dumps({
+            "status": "timestamps_loaded",
+            "count": len(lrc_lines),
+            "progress": 0.3
+        }) + "\n"
+        
+        # Start Genius fetch in background
+        genius_task = asyncio.create_task(fetch_genius_lyrics(song, artist))
+        
+        # Send first batch immediately
+        first_batch = min(10, len(lrc_lines))
+        if first_batch > 0:
+            first_lines = lrc_lines[:first_batch]
+            translated = await batch_translate_lines([l['reference'] for l in first_lines])
+            
+            for i in range(first_batch):
+                yield json.dumps({
+                    "line": f"{first_lines[i]['timestamp']} {translated[i]}",
+                    "index": i,
+                    "total": len(lrc_lines),
+                    "progress": 0.4 + (i / len(lrc_lines) * 0.2)
+                }) + "\n"
+        
+        # Get Genius result
+        genius_result = await genius_task
+        romaji_text = None
+        
+        if genius_result:
+            romaji_text, _ = genius_result
+            yield json.dumps({
+                "status": "genius_loaded",
+                "progress": 0.6
+            }) + "\n"
+            
+            # Process remaining lines with alignment
+            remaining = lrc_lines[first_batch:]
+            if romaji_text:
+                aligned = await advanced_align_lyrics(remaining, romaji_text)
+                for i, line in enumerate(aligned, start=first_batch):
+                    yield json.dumps({
+                        "line": line,
+                        "index": i,
+                        "total": len(lrc_lines),
+                        "progress": 0.6 + (i / len(lrc_lines) * 0.4)
+                    }) + "\n"
+            else:
+                # No genius, translate remaining
+                translated = await batch_translate_lines([l['reference'] for l in remaining])
+                for i in range(len(remaining)):
+                    yield json.dumps({
+                        "line": f"{remaining[i]['timestamp']} {translated[i]}",
+                        "index": i + first_batch,
+                        "total": len(lrc_lines),
+                        "progress": 0.6 + ((i + first_batch) / len(lrc_lines) * 0.4)
+                    }) + "\n"
+        else:
+            # No genius at all, translate everything
+            remaining = lrc_lines[first_batch:]
+            translated = await batch_translate_lines([l['reference'] for l in remaining])
             for i in range(len(remaining)):
                 yield json.dumps({
                     "line": f"{remaining[i]['timestamp']} {translated[i]}",
-                    "index": i + 15,
-                    "total": len(lrc_data),
-                    "progress": 0.6 + ((i + 15) / len(lrc_data) * 0.4)
+                    "index": i + first_batch,
+                    "total": len(lrc_lines),
+                    "progress": 0.6 + ((i + first_batch) / len(lrc_lines) * 0.4)
                 }) + "\n"
         
-        yield json.dumps({"status": "complete", "progress": 1.0}) + "\n"
+        yield json.dumps({
+            "status": "complete",
+            "progress": 1.0
+        }) + "\n"
     
     return StreamingResponse(generate(), media_type="application/x-ndjson")
 
-# --- 7. EXISTING ENDPOINTS (UPDATED) ---
+# --- 7. ENDPOINTS ---
 @app.get("/")
 async def root():
-    return {"status": "Online", "mode": "Smart Hybrid v2"}
+    return {
+        "status": "Online", 
+        "mode": "Enhanced Lyrics Processor",
+        "features": ["Genius Romaji", "AI Translation", "Smart Alignment", "Real-time Streaming"]
+    }
 
 @app.get("/convert")
 async def convert_single_line(text: str = ""):
     """Quick single line conversion"""
     if not text: 
-        raise HTTPException(400, "No text")
+        raise HTTPException(400, "No text provided")
     
-    if text in line_cache: 
-        return {"original": text, "romaji": line_cache[text]}
+    cache_key = f"convert:{hashlib.md5(text.encode()).hexdigest()}"
+    if cache_key in line_cache:
+        return {"original": text, "romaji": line_cache[cache_key]}
     
-    if not client: 
+    if not client:
         return {"original": text, "romaji": text}
     
     try:
-        romaji = await translate_line(text)
-        line_cache[text] = romaji
+        romaji = await translate_line_simple(text)
+        line_cache[cache_key] = romaji
         return {"original": text, "romaji": romaji}
-    except: 
+    except Exception as e:
+        print(f"Conversion error: {e}")
         return {"original": text, "romaji": text}
 
 @app.get("/get_song")
@@ -493,14 +677,38 @@ async def get_song_endpoint(song: str, artist: str):
     """Main endpoint for song lyrics"""
     return await process_song(song, artist)
 
+@app.get("/search")
+async def search_songs(query: str):
+    """Search for songs on LRCLib"""
+    try:
+        url = "https://lrclib.net/api/search"
+        params = {"q": query}
+        resp = requests.get(url, params=params, timeout=5)
+        data = resp.json()
+        
+        # Format results
+        results = []
+        for item in data.get("data", [])[:10]:  # Limit to 10 results
+            results.append({
+                "song": item.get("trackName"),
+                "artist": item.get("artistName"),
+                "album": item.get("albumName"),
+                "duration": item.get("duration"),
+                "has_lyrics": bool(item.get("syncedLyrics"))
+            })
+        
+        return {"query": query, "results": results}
+    except Exception as e:
+        raise HTTPException(500, f"Search failed: {e}")
+
 @app.delete("/clear_cache")
-async def clear():
+async def clear_cache():
     """Clear all caches"""
     song_cache.clear()
     line_cache.clear()
-    if redis_client: 
+    if redis_client:
         redis_client.flushdb()
-    return {"status": "cleared"}
+    return {"status": "Cache cleared", "memory_items": len(song_cache)}
 
 @app.get("/health")
 async def health():
@@ -509,41 +717,23 @@ async def health():
         "deepseek": bool(client),
         "redis": redis_client.ping() if redis_client else False,
         "genius": bool(GENIUS_API_TOKEN),
-        "cache_size": len(song_cache)
+        "cache": {
+            "songs": len(song_cache),
+            "lines": len(line_cache)
+        }
     }
     return status
 
-# Quick align fallback (for simple cases)
-def quick_align(lrc_lines, romaji_text):
-    """Simple word-based alignment as fallback"""
-    romaji_lines = [l.strip() for l in romaji_text.split('\n') if l.strip()]
-    
-    result = []
-    romaji_idx = 0
-    
-    for lrc in lrc_lines:
-        jp_words = set(lrc['reference'].split())
-        
-        # Look for matching line in nearby positions
-        best_score = 0
-        best_line = None
-        
-        for i in range(max(0, romaji_idx-2), min(len(romaji_lines), romaji_idx+3)):
-            romaji_words = set(romaji_lines[i].split())
-            overlap = len(jp_words & romaji_words)
-            
-            if overlap > best_score:
-                best_score = overlap
-                best_line = romaji_lines[i]
-                romaji_idx = i + 1
-        
-        if best_score >= 1:  # At least one word overlap
-            result.append(f"{lrc['timestamp']} {best_line}")
-        else:
-            result.append(f"{lrc['timestamp']} {lrc['reference']}")
-    
-    return result
+@app.get("/stats")
+async def stats():
+    """Get usage statistics"""
+    return {
+        "cache_size": len(song_cache),
+        "line_cache_size": len(line_cache),
+        "thread_pool_workers": executor._max_workers,
+        "active_tasks": len(asyncio.all_tasks())
+    }
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
