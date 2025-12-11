@@ -43,7 +43,6 @@ setup_systems()
 
 # --- 1. FETCH TIMESTAMPS (LRCLib) ---
 async def fetch_lrc_timestamps(song: str, artist: str) -> Optional[List[Dict]]:
-    """Get the perfect timestamps (and Japanese text)"""
     try:
         url = "https://lrclib.net/api/get"
         loop = asyncio.get_event_loop()
@@ -57,20 +56,18 @@ async def fetch_lrc_timestamps(song: str, artist: str) -> Optional[List[Dict]]:
             if not line.strip(): continue
             match = re.match(r'(\[\d+:\d+\.\d+\])\s*(.*)', line)
             if match:
-                # We keep the Japanese text as a reference for the AI
+                # We keep the Japanese text as a reference/fallback
                 lines.append({'timestamp': match.group(1), 'reference': match.group(2).strip()})
         return lines
     except: return None
 
 # --- 2. FETCH ROMAJI (Genius) ---
 async def fetch_genius_romaji(song: str, artist: str) -> Optional[str]:
-    """Search specifically for a Romaji version"""
     if not GENIUS_API_TOKEN: return None
     try:
         headers = {"Authorization": f"Bearer {GENIUS_API_TOKEN}"}
         loop = asyncio.get_event_loop()
         
-        # Search query focused on finding the Romaji version
         search_query = f"{song} Romaji {artist}"
         resp = await loop.run_in_executor(None, lambda: requests.get("https://api.genius.com/search", headers=headers, params={"q": search_query}, timeout=10))
         data = resp.json()
@@ -98,40 +95,35 @@ async def fetch_genius_romaji(song: str, artist: str) -> Optional[str]:
         # Validation: If it has too many Japanese characters, it's not Romaji
         jp_chars = len(re.findall(r'[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]', text))
         if jp_chars > len(text) * 0.2: 
-            print("⚠️ Found Genius lyrics, but they look Japanese, not Romaji.")
             return None
             
         return text
     except: return None
 
-# --- 3. AI ALIGNER (The Brain) ---
+# --- 3. AI ALIGNER (The Smart Merger) ---
 async def align_lyrics_strict(lrc_lines: List[Dict], romaji_block: str) -> List[str]:
-    """
-    Tells DeepSeek to map the Romaji block onto the Timestamps.
-    """
     if not client: return []
     
     prompt = f"""You are a Lyrics Synchronizer.
     
-    I have a list of TIMESTAMPS (from the audio file).
-    I have a block of ROMAJI TEXT (from a lyric site).
+    I have {len(lrc_lines)} TIMESTAMPS (Japanese source).
+    I have a block of ROMAJI TEXT (from Genius).
     
-    YOUR JOB:
-    Map the Romaji lines to the correct Timestamps.
+    TASK: Map the Romaji to the Timestamps.
     
-    RULES:
-    1. The number of output lines MUST match the number of Timestamps ({len(lrc_lines)} lines).
-    2. If the Romaji block has extra lines (like [Chorus]), IGNORE them.
-    3. If the Romaji block is missing lines, use the 'reference' Japanese text I provided and translate it yourself.
-    4. Output strictly a JSON array of strings.
+    CRITICAL RULES:
+    1. Output EXACTLY {len(lrc_lines)} lines. One for each timestamp.
+    2. If Genius has extra lines (like [Chorus] or duplicates), SKIP THEM.
+    3. If Genius is MISSING lines, TRANSLATE the Japanese reference I gave you.
+    4. Priority is SYNC over TEXT. Do not break the timestamp order.
     
-    TIMESTAMPS & REFERENCE:
+    TIMESTAMPS & REFERENCE JP:
     {json.dumps(lrc_lines[:60], ensure_ascii=False)}
     
     ROMAJI SOURCE:
     {romaji_block[:3000]}
     
-    OUTPUT SCHEMA:
+    OUTPUT SCHEMA JSON:
     {{ "lines": ["[00:12.34] Romaji Text"] }}
     """
     
@@ -143,18 +135,26 @@ async def align_lyrics_strict(lrc_lines: List[Dict], romaji_block: str) -> List[
             response_format={"type": "json_object"}
         )
         data = json.loads(completion.choices[0].message.content)
-        return data.get("lines", [])
+        result_lines = data.get("lines", [])
+        
+        # Safety Check: Did AI return the right amount?
+        if len(result_lines) != len(lrc_lines):
+            print(f"⚠️ Mismatch detected (Expected {len(lrc_lines)}, got {len(result_lines)}). Aborting merge.")
+            return [] # Fail to trigger fallback
+            
+        return result_lines
     except Exception as e:
         print(f"Alignment Error: {e}")
         return []
 
-# --- 4. FALLBACK TRANSLATOR ---
+# --- 4. FALLBACK TRANSLATOR (Guaranteed Sync) ---
 async def just_translate(lrc_lines: List[Dict]) -> List[str]:
     if not client: return []
     texts = [l['reference'] for l in lrc_lines]
     
-    prompt = f"""Convert these Japanese lines to Hepburn Romaji.
+    prompt = f"""Convert these {len(texts)} Japanese lines to Hepburn Romaji.
     Output JSON: {{ "romaji": ["line1", "line2"] }}
+    Strictly 1 line input = 1 line output.
     INPUT: {json.dumps(texts, ensure_ascii=False)}"""
     
     try:
@@ -176,7 +176,7 @@ async def just_translate(lrc_lines: List[Dict]) -> List[str]:
 
 # --- 5. MAIN LOGIC ---
 async def process_song(song: str, artist: str):
-    cache_key = f"genius_prio:{song.lower()}:{artist.lower()}"
+    cache_key = f"hybrid:{song.lower()}:{artist.lower()}"
     
     if cache_key in song_cache: return song_cache[cache_key]
     if redis_client:
@@ -197,13 +197,13 @@ async def process_song(song: str, artist: str):
     source = ""
 
     if romaji_text:
-        print("✨ Found Genius Romaji! Aligning...")
+        print("✨ Found Genius Romaji! Attempting strict align...")
         final_lyrics = await align_lyrics_strict(lrc_data, romaji_text)
-        source = "Genius Romaji (Aligned)"
         
-        # Fallback check: If alignment failed (empty list), revert to translation
-        if not final_lyrics:
-            print("⚠️ Alignment failed. Falling back to translation.")
+        if final_lyrics:
+            source = "Merged (Genius Romaji)"
+        else:
+            print("⚠️ Alignment unsafe. Falling back to Translation.")
             final_lyrics = await just_translate(lrc_data)
             source = "Translated (AI Fallback)"
     else:
@@ -221,8 +221,9 @@ async def process_song(song: str, artist: str):
 # --- ENDPOINTS ---
 @app.get("/")
 async def root():
-    return {"status": "Online", "mode": "Genius Priority"}
+    return {"status": "Online", "mode": "Safe Hybrid"}
 
+# ✅ FIXED: Restored for Floating App compatibility
 @app.get("/convert")
 async def convert_single_line(text: str = ""):
     if not text: raise HTTPException(400, "No text")
