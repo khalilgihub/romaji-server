@@ -3,3 +3,4 @@ uvicorn
 requests
 redis
 openai
+beautifulsoup4
