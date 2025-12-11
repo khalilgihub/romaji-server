@@ -1,102 +1,272 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-# IMPORT GROQ CLIENT
-from groq import AsyncGroq 
+from fastapi import FastAPI, HTTPException
+from openai import AsyncOpenAI
 import requests
 import os
 import re
-import asyncio
 import hashlib
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import List, Optional, Dict
 import json
 import redis
+from bs4 import BeautifulSoup
+import asyncio
 
 app = FastAPI()
 
 # --- CONFIGURATION ---
-# Make sure you add GROQ_API_KEY to Render Environment Variables
-API_KEY = os.environ.get("GROQ_API_KEY") 
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY") 
+GENIUS_API_TOKEN = os.environ.get("GENIUS_API_TOKEN")
 REDIS_URL = os.environ.get("REDIS_URL")
 
-# MODEL SETTINGS
-# "llama-3.1-8b-instant" is the fastest and has the highest rate limits
-GROQ_MODEL = "llama-3.1-8b-instant" 
-DAILY_REQUEST_LIMIT = 1000  # Groq allows ~14k requests/day, so 1000 is very safe
+# MODEL SETTING:
+# "deepseek-chat" (V3) is BEST for speed and formatting.
+# "deepseek-reasoner" (R1) is smarter but slower/more expensive.
+DEEPSEEK_MODEL = "deepseek-chat" 
+
+# NO LIMIT SETTING:
+# Set to a number you will practically never reach (1 Billion)
+DAILY_REQUEST_LIMIT = 1_000_000_000
 
 client = None
 redis_client = None
-
-# --- 1. SETUP SYSTEMS ---
-def setup_systems():
-    global client, redis_client
-    
-    # Setup Groq
-    if not API_KEY:
-        print("❌ CRITICAL: GROQ_API_KEY missing!")
-    else:
-        try:
-            client = AsyncGroq(api_key=API_KEY)
-            print(f"✅ Groq AI Online: {GROQ_MODEL}")
-        except Exception as e:
-            print(f"❌ AI Error: {e}")
-
-    # Setup Redis
-    if not REDIS_URL:
-        print("⚠️ WARNING: Redis missing! Cache will reset on restart.")
-    else:
-        try:
-            redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-            redis_client.ping()
-            print("✅ Redis Online: Persistent Cache Active")
-        except Exception as e:
-            print(f"❌ Redis Error: {e}")
-
-setup_systems()
-
-# --- 2. QUOTA MANAGEMENT (Redis-Backed) ---
-def check_quota() -> bool:
-    """Tracks usage in Redis so restarts don't reset your count"""
-    if not redis_client: return True # Fallback if Redis is down
-    
-    today = datetime.now().strftime("%Y-%m-%d")
-    quota_key = f"quota:groq:{today}"
-    
-    try:
-        current = int(redis_client.get(quota_key) or 0)
-        if current >= DAILY_REQUEST_LIMIT:
-            print(f"⛔ Daily Limit Hit: {current}/{DAILY_REQUEST_LIMIT}")
-            return False
-            
-        # Increment usage safely
-        pipe = redis_client.pipeline()
-        pipe.incr(quota_key)
-        pipe.expire(quota_key, 86400) # Auto-delete after 24h
-        pipe.execute()
-        return True
-    except: return True
-
-# --- 3. STORAGE & CACHING ---
 line_cache = {}
 song_cache = {}
 
-def get_from_redis(key: str):
+def setup_systems():
+    global client, redis_client
+    if DEEPSEEK_API_KEY:
+        try:
+            client = AsyncOpenAI(
+                api_key=DEEPSEEK_API_KEY,
+                base_url="https://api.deepseek.com"
+            )
+            print(f"✅ DeepSeek AI Online: {DEEPSEEK_MODEL} (Unlimited Mode)")
+        except Exception as e:
+            print(f"❌ AI Error: {e}")
+    
+    if REDIS_URL:
+        try:
+            redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+            redis_client.ping()
+            print("✅ Redis Online")
+        except Exception as e:
+            print(f"❌ Redis Error: {e}")
+            
+    if GENIUS_API_TOKEN:
+        print("✅ Genius API Token Loaded")
+    else:
+        print("⚠️ Genius API Token Missing")
+
+setup_systems()
+
+# --- GENIUS API FUNCTIONS ---
+
+def search_genius(song: str, artist: str) -> Optional[str]:
+    if not GENIUS_API_TOKEN: return None
+    try:
+        headers = {"Authorization": f"Bearer {GENIUS_API_TOKEN}"}
+        response = requests.get(
+            "https://api.genius.com/search", 
+            headers=headers, 
+            params={"q": f"{song} {artist}"}, 
+            timeout=10
+        )
+        data = response.json()
+        if data['response']['hits']:
+            return data['response']['hits'][0]['result']['url']
+    except Exception as e:
+        print(f"Genius Search Error: {e}")
+    return None
+
+def scrape_genius_lyrics(song_url: str) -> Optional[Dict[str, str]]:
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        response = requests.get(song_url, headers=headers, timeout=15)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        lyrics_divs = soup.find_all('div', {'data-lyrics-container': 'true'})
+        if not lyrics_divs: return None
+        
+        full_text = []
+        for div in lyrics_divs:
+            for element in div.descendants:
+                if element.name == 'br': full_text.append('\n')
+                elif isinstance(element, str):
+                    text = element.strip()
+                    if text: full_text.append(text)
+        
+        lyrics = '\n'.join(full_text)
+        
+        # Simple detection logic
+        lines = lyrics.split('\n')
+        japanese_lines = []
+        romaji_lines = []
+        
+        for line in lines:
+            if not line.strip(): continue
+            if re.search(r'[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]', line):
+                japanese_lines.append(line)
+            elif re.match(r'^[a-zA-Z\s\-\'\.!?,()]+$', line) and len(line) > 3:
+                romaji_lines.append(line)
+        
+        result = {}
+        if japanese_lines and romaji_lines and len(romaji_lines) > len(japanese_lines) * 0.5:
+            result['japanese'] = '\n'.join(japanese_lines)
+            result['romaji'] = '\n'.join(romaji_lines)
+            result['source'] = 'genius_dual'
+        elif romaji_lines and len(romaji_lines) > 10:
+            result['romaji'] = '\n'.join(romaji_lines)
+            result['source'] = 'genius_romaji'
+        elif japanese_lines:
+            result['japanese'] = '\n'.join(japanese_lines)
+            result['source'] = 'genius_japanese'
+        else:
+            result['lyrics'] = lyrics
+            result['source'] = 'genius_mixed'
+            
+        return result
+    except Exception as e:
+        print(f"Genius Scraping Error: {e}")
+        return None
+
+def fetch_from_lrclib(song: str, artist: str, duration: int = 0) -> Optional[Dict]:
+    try:
+        params = {"track_name": song, "artist_name": artist}
+        if duration > 0: params["duration"] = duration
+        response = requests.get("https://lrclib.net/api/get", params=params, timeout=10)
+        data = response.json()
+        synced = data.get("syncedLyrics")
+        plain = data.get("plainLyrics")
+        if synced or plain:
+            return {"synced": synced, "plain": plain, "source": "lrclib"}
+    except: pass
+    return None
+
+# --- SMART LYRICS FETCHER ---
+
+async def fetch_lyrics_smart(song: str, artist: str, duration: int = 0) -> Optional[Dict]:
+    cache_key = f"lyrics:{song.lower()}:{artist.lower()}"
+    
+    if cache_key in song_cache: return song_cache[cache_key]
+    cached = get_from_redis(cache_key)
+    if cached: 
+        song_cache[cache_key] = cached
+        return cached
+    
+    print(f"🔍 Fetching: {song} - {artist}")
+    
+    # 1. Genius
+    genius_url = search_genius(song, artist)
+    if genius_url:
+        genius_data = scrape_genius_lyrics(genius_url)
+        if genius_data:
+            if 'romaji' in genius_data:
+                result = {"lyrics": genius_data['romaji'], "type": "romaji", "source": genius_data['source'], "ai_used": False}
+                save_and_cache(cache_key, result)
+                return result
+            if 'japanese' in genius_data:
+                print("🤖 Genius found Japanese, converting...")
+                romaji = await convert_japanese_to_romaji(genius_data['japanese'])
+                result = {"lyrics": romaji, "type": "romaji_converted", "source": "genius_converted", "ai_used": True}
+                save_and_cache(cache_key, result)
+                return result
+
+    # 2. LRCLib
+    lrclib_data = fetch_from_lrclib(song, artist, duration)
+    if lrclib_data:
+        lyrics_text = lrclib_data['synced'] or lrclib_data['plain']
+        lines = parse_lrc_format(lyrics_text)
+        
+        needs_conversion = any(re.search(r'[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]', line['text']) for line in lines)
+        
+        if needs_conversion:
+            print("🤖 LRCLib found Japanese, converting...")
+            converted_lines = await convert_lrc_lines(lines)
+            result = {"lyrics": '\n'.join(converted_lines), "type": "lrc_romaji", "source": "lrclib_converted", "ai_used": True}
+        else:
+            result = {"lyrics": lyrics_text, "type": "lrc_original", "source": "lrclib", "ai_used": False}
+            
+        save_and_cache(cache_key, result)
+        return result
+    
+    return None
+
+# --- HELPER FUNCTIONS ---
+
+def save_and_cache(key, data):
+    song_cache[key] = data
+    if redis_client:
+        try: redis_client.setex(key, 2592000, json.dumps(data))
+        except: pass
+
+def get_from_redis(key):
     if not redis_client: return None
     try:
         data = redis_client.get(key)
         return json.loads(data) if data else None
     except: return None
 
-def save_to_redis(key: str, data: dict, ttl=2592000): # 30 days
-    if not redis_client: return
-    try:
-        redis_client.setex(key, ttl, json.dumps(data))
-    except: pass
+def parse_lrc_format(lrc_text: str) -> List[Dict]:
+    lines = []
+    for line in lrc_text.split('\n'):
+        if not line.strip(): continue
+        match = re.match(r'(\[\d+:\d+\.\d+\])\s*(.*)', line)
+        if match:
+            lines.append({'timestamp': match.group(1), 'text': match.group(2).strip()})
+        else:
+            lines.append({'timestamp': '', 'text': line.strip()})
+    return lines
 
-# --- 4. AI CONVERSION LOGIC ---
+async def convert_lrc_lines(lines: List[Dict]) -> List[str]:
+    texts = [l['text'] for l in lines if l['text']]
+    # DeepSeek V3 has a huge context window, we can send larger batches
+    BATCH_SIZE = 50 
+    romaji_results = []
+    
+    for i in range(0, len(texts), BATCH_SIZE):
+        batch = texts[i:i+BATCH_SIZE]
+        converted_batch = await convert_batch(batch)
+        romaji_results.extend(converted_batch)
+    
+    romaji_map = dict(zip(texts, romaji_results))
+    result_lines = []
+    for line in lines:
+        if line['text']:
+            romaji = romaji_map.get(line['text'], line['text'])
+            result_lines.append(f"{line['timestamp']} {romaji}")
+        else:
+            result_lines.append("")
+    return result_lines
+
+async def convert_japanese_to_romaji(text: str) -> str:
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    BATCH_SIZE = 50
+    all_converted = []
+    for i in range(0, len(lines), BATCH_SIZE):
+        batch = lines[i:i+BATCH_SIZE]
+        converted = await convert_batch(batch)
+        all_converted.extend(converted)
+    return '\n'.join(all_converted)
+
+# --- AI CONVERSION ---
+
+def check_quota() -> bool:
+    """Non-blocking quota tracker"""
+    if not redis_client: return True
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        quota_key = f"quota:deepseek:{today}"
+        # We allow it to pass even if 'limit' is reached because limit is 1 Billion
+        pipe = redis_client.pipeline()
+        pipe.incr(quota_key)
+        pipe.expire(quota_key, 86400)
+        pipe.execute()
+        return True
+    except: return True
+
 async def convert_batch(texts: List[str]) -> List[str]:
     if not texts or not client: return texts
     
-    # A. Check Caches
     uncached_idxs = []
     results = [None] * len(texts)
     
@@ -108,7 +278,6 @@ async def convert_batch(texts: List[str]) -> List[str]:
         text_hash = hashlib.md5(text.encode()).hexdigest()
         redis_key = f"line:{text_hash}"
         cached = get_from_redis(redis_key)
-        
         if cached:
             results[i] = cached['romaji']
             line_cache[text] = cached['romaji']
@@ -117,29 +286,24 @@ async def convert_batch(texts: List[str]) -> List[str]:
             
     if not uncached_idxs: return results
 
-    # B. Check Quota
-    if not check_quota():
-        print("⚠️ Quota limit reached, skipping AI.")
-        for idx in uncached_idxs: results[idx] = texts[idx]
-        return results
-
-    # C. Call Groq AI
+    check_quota() # Track stats but don't block
+    
     subset = [texts[i] for i in uncached_idxs]
     
-    prompt = f"""Convert these {len(subset)} Japanese lyrics to Romaji (Hepburn).
-    Output EXACTLY {len(subset)} lines. Format: "1. romaji"
-    NO intro/outro.
-    
-    INPUT:
-    {chr(10).join([f"{i+1}. {t}" for i, t in enumerate(subset)])}"""
+    prompt = f"""Convert these {len(subset)} Japanese lyric lines to Romaji (Hepburn style).
+Output EXACTLY {len(subset)} lines. Format: "1. romaji_text"
+NO explanations.
+
+INPUT:
+{chr(10).join([f"{i+1}. {t}" for i, t in enumerate(subset)])}"""
     
     try:
         completion = await client.chat.completions.create(
             messages=[
-                {"role": "system", "content": "You are a precise Japanese-to-Romaji converter."},
+                {"role": "system", "content": "You are a Japanese-to-Romaji converter."},
                 {"role": "user", "content": prompt}
             ],
-            model=GROQ_MODEL,
+            model=DEEPSEEK_MODEL,
             temperature=0.1,
             max_tokens=4096
         )
@@ -154,85 +318,28 @@ async def convert_batch(texts: List[str]) -> List[str]:
                 if 0 <= idx_in_subset < len(uncached_idxs):
                     original_idx = uncached_idxs[idx_in_subset]
                     romaji = match.group(2).strip()
-                    
                     results[original_idx] = romaji
                     line_cache[texts[original_idx]] = romaji
                     
                     thash = hashlib.md5(texts[original_idx].encode()).hexdigest()
-                    save_to_redis(f"line:{thash}", {'romaji': romaji})
-                    
+                    if redis_client:
+                        try: redis_client.setex(f"line:{thash}", 2592000, json.dumps({'romaji': romaji}))
+                        except: pass
+                        
     except Exception as e:
-        print(f"❌ Groq Error: {e}")
+        print(f"❌ DeepSeek Error: {e}")
 
-    # Fill failures
     for i in range(len(results)):
         if results[i] is None: results[i] = texts[i]
         
     return results
 
-# --- 5. SONG PROCESSING ---
-async def process_song(song: str, artist: str):
-    cache_key = f"song:{song.lower()}:{artist.lower()}"
-    
-    # Check Cache
-    if cache_key in song_cache: return song_cache[cache_key]
-    cached = get_from_redis(cache_key)
-    if cached: 
-        song_cache[cache_key] = cached
-        return cached
-
-    # Fetch Lyrics
-    try:
-        url = "https://lrclib.net/api/get"
-        resp = requests.get(url, params={"track_name": song, "artist_name": artist}, timeout=10)
-        data = resp.json()
-        raw = data.get("syncedLyrics") or data.get("plainLyrics")
-        if not raw: return None
-    except: return None
-
-    # Parse Lines
-    lines = []
-    for l in raw.split('\n'):
-        if not l.strip(): continue
-        m = re.match(r'(\[\d+:\d+\.\d+\])\s*(.*)', l)
-        if m: lines.append({'time': m.group(1), 'text': m.group(2).strip()})
-        else: lines.append({'time': '', 'text': l.strip()})
-
-    # Batch Convert
-    texts = [x['text'] for x in lines if x['text']]
-    romaji_map = {}
-    
-    # Process in batches of 40 (Groq handles this easily)
-    for i in range(0, len(texts), 40):
-        batch = texts[i:i+40]
-        converted = await convert_batch(batch)
-        for orig, conv in zip(batch, converted):
-            romaji_map[orig] = conv
-            
-    final_lines = []
-    for l in lines:
-        romaji = romaji_map.get(l['text'], l['text'])
-        final_lines.append(f"{l['time']} {romaji}")
-
-    result = {
-        "lyrics": '\n'.join(final_lines), 
-        "song": song, 
-        "artist": artist,
-        "cached": False,
-        "model": GROQ_MODEL
-    }
-    
-    song_cache[cache_key] = result
-    save_to_redis(cache_key, result)
-    return result
-
-# --- 6. API ENDPOINTS ---
+# --- ENDPOINTS ---
 
 @app.get("/")
 async def root():
-    return {"status": "Online", "provider": "Groq", "model": GROQ_MODEL}
+    return {"status": "Online", "provider": "DeepSeek", "model": DEEPSEEK_MODEL}
 
-# RESTORED /convert ENDPOINT
 @app.get("/convert")
 async def convert_single_line(text: str = ""):
     if not text: raise HTTPException(400, "No text provided")
@@ -240,9 +347,9 @@ async def convert_single_line(text: str = ""):
     return {"original": text, "romaji": results[0]}
 
 @app.get("/get_song")
-async def get_song_endpoint(song: str, artist: str):
-    res = await process_song(song, artist)
-    if res: return res
+async def get_song_endpoint(song: str, artist: str, duration: int = 0):
+    result = await fetch_lyrics_smart(song, artist, duration)
+    if result: return result
     raise HTTPException(404, "Song not found")
 
 @app.get("/cache_status")
@@ -250,10 +357,10 @@ async def status():
     used = 0
     if redis_client:
         today = datetime.now().strftime("%Y-%m-%d")
-        used = redis_client.get(f"quota:groq:{today}") or 0
+        used = redis_client.get(f"quota:deepseek:{today}") or 0
     return {
         "redis": redis_client is not None,
         "quota_used": int(used),
-        "quota_limit": DAILY_REQUEST_LIMIT,
-        "model": GROQ_MODEL
+        "limit": "UNLIMITED",
+        "model": DEEPSEEK_MODEL
     }
