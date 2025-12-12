@@ -4,9 +4,7 @@ requests
 openai
 beautifulsoup4
 redis
+fugashi
+mecab-python3
 pykakasi
 jaconv
-fugashi
-unidic-lite
-ipadic
-
