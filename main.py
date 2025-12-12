@@ -410,13 +410,12 @@ async def polish_with_genius_reference(mecab_lyrics: List[str], genius_romaji: s
     prompt = f"""Polish these Romaji lyrics to sound more natural, using Genius as reference.
 
 MECAB OUTPUT (100% accurate but mechanical):
-{chr(10).join([f"{i+1}. {line}" for i, line in enumerate(mecab_lyrics[:30]])}
+{chr(10).join([f'{i+1}. {line}' for i, line in enumerate(mecab_lyrics[:30])])}")
 
-GENIUS REFERENCE (may have errors but natural flow):
-{chr(10).join([f"{i+1}. {line}" for i, line in enumerate(genius_lines[:30]])}
 
-ORIGINAL JAPANESE:
-{chr(10).join([f"{i+1}. {line}" for i, line in enumerate(japanese_lines[:30]])}
+{chr(10).join([f'{i+1}. {line}' for i, line in enumerate(genius_lines[:30])])}")
+
+{chr(10).join([f'{i+1}. {line}' for i, line in enumerate(japanese_lines[:30])])}")
 
 RULES:
 1. Keep MeCab's accuracy for particles (は→wa, を→wo, へ→e)
@@ -706,3 +705,4 @@ async def test_mecab():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+
