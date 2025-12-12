@@ -5,3 +5,8 @@ redis
 openai
 beautifulsoup4
 jaconv
+fugashi
+unidic-lite
+pykakasi
+mecab-python3
+ipadic
