@@ -191,6 +191,7 @@ def get_word_reading(node: fugashi.Node) -> Optional[str]:
 def mecab_to_romaji_perfect(japanese: str) -> str:
     """
     Convert Japanese to perfectly spaced Romaji using MeCab segmentation
+    FIXED: Now properly iterates over MeCab nodes
     """
     if not tagger:
         # Fallback: simple conversion without spaces
@@ -199,14 +200,12 @@ def mecab_to_romaji_perfect(japanese: str) -> str:
         return japanese
     
     try:
-        # Parse with MeCab - this returns a list of nodes
-        nodes = tagger.parse(japanese)
-        
+        # FIXED: Call tagger directly to get node iterator
         romaji_parts = []
         
-        for node in nodes:
+        for node in tagger(japanese):  # This is the correct way!
             word = node.surface
-            if not word or word.strip() == "":
+            if not word:
                 continue
             
             # Get reading from MeCab
@@ -237,6 +236,8 @@ def mecab_to_romaji_perfect(japanese: str) -> str:
         # Special case: fix remaining 'ha' particles
         result = re.sub(r'\bha\b', 'wa', result)
         
+        logger.debug(f"Converted '{japanese}' -> '{result}' ({len(romaji_parts)} words)")
+        
         return result
         
     except Exception as e:
@@ -252,12 +253,12 @@ def mecab_analyze_line(japanese: str) -> List[WordAnalysis]:
         return []
     
     try:
-        nodes = tagger.parse(japanese)
+        # FIXED: Call tagger directly to get node iterator
         analysis = []
         
-        for node in nodes:
+        for node in tagger(japanese):  # This is the correct way!
             word = node.surface
-            if not word or word.strip() == "":
+            if not word:
                 continue
             
             # Get reading
@@ -678,9 +679,10 @@ async def fetch_genius_lyrics_fast(song: str, artist: str) -> Optional[Tuple[str
 async def root():
     return {
         "status": "Online",
-        "version": "MeCab Ultimate v2",
+        "version": "MeCab Ultimate v2.1 FIXED",
         "engine": "MeCab+PyKakasi+AI",
         "accuracy": "Word-perfect segmentation with proper spacing",
+        "fix_applied": "Corrected MeCab node iteration for proper word spacing",
         "features": [
             "Perfect word spacing in romaji",
             "MeCab-based accurate segmentation",
@@ -716,6 +718,7 @@ async def convert_simple(text: str = "") -> Dict:
         "original": text,
         "romaji": romaji,
         "word_count": len(romaji.split()),
+        "has_spaces": " " in romaji,
         "engine": "MeCab+PyKakasi"
     }
 
@@ -743,6 +746,7 @@ async def convert_mecab(text: str = "") -> Dict:
         "romaji": romaji,
         "analysis": [a.__dict__ for a in analysis],
         "word_count": len(analysis),
+        "has_spaces": " " in romaji,
         "engine": "MeCab+PyKakasi"
     }
     
@@ -806,74 +810,4 @@ async def stream_mecab(song: str, artist: str):
     
     return StreamingResponse(generate(), media_type="application/x-ndjson")
 
-@app.delete("/clear_cache")
-async def clear_cache() -> Dict:
-    """Clear all caches"""
-    song_cache.clear()
-    line_cache.clear()
-    if redis_client:
-        redis_client.flushdb()
-    return {"status": "All caches cleared"}
-
-@app.get("/test_spacing")
-async def test_spacing() -> Dict:
-    """Test MeCab spacing accuracy"""
-    test_cases = [
-        "今日もまた足の踏み場は無い",
-        "小部屋が孤独を甘やかす",
-        "「不慣れな悲鳴を愛さないで",
-        "夜道を迷ぐれど虚しい",
-        "愛してる一人鳴き喚いて",
-        "体を触って必要なのはこれだけ認めて",
-        "確信できる今だけ重ねて"
-    ]
-    
-    results = []
-    for text in test_cases:
-        romaji = mecab_to_romaji_perfect(text)
-        words = romaji.split()
-        
-        results.append({
-            "japanese": text,
-            "romaji": romaji,
-            "word_count": len(words),
-            "has_spaces": " " in romaji,
-            "spacing_ok": len(words) > 1,
-            "sample_words": words[:3] if words else []
-        })
-    
-    return {
-        "test": "Word Spacing Accuracy Test",
-        "results": results,
-        "summary": {
-            "total": len(results),
-            "with_spaces": sum(1 for r in results if r["has_spaces"]),
-            "spacing_issues": sum(1 for r in results if not r["spacing_ok"]),
-            "engine": "MeCab+PyKakasi"
-        }
-    }
-
-@app.get("/health")
-async def health_check() -> Dict:
-    """System health check"""
-    return {
-        "status": "healthy",
-        "timestamp": time.time(),
-        "components": {
-            "mecab": tagger is not None,
-            "kakasi": kakasi_converter is not None,
-            "deepseek": client is not None,
-            "redis": redis_client is not None if REDIS_URL else "not_configured",
-            "genius": bool(GENIUS_API_TOKEN)
-        },
-        "memory_cache": {
-            "song_cache": len(song_cache),
-            "line_cache": len(line_cache)
-        }
-    }
-
-# --- MAIN ---
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+@app.
