@@ -1,14 +1,16 @@
 #!/bin/bash
 set -e
 
-echo "Installing MeCab system packages..."
+echo "🔧 Installing MeCab (SYSTEM PACKAGE)..."
 apt-get update
-apt-get install -y mecab libmecab-dev mecab-ipadic-utf8
+apt-get install -y --no-install-recommends \
+    mecab \
+    mecab-ipadic-utf8 \
+    libmecab-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-echo "Installing Python packages..."
+echo "📦 Installing Python packages..."
+pip install --upgrade pip
 pip install -r requirements.txt
 
-echo "Downloading dictionaries..."
-python -c "import unidic_lite; unidic_lite.download()" 2>/dev/null || true
-
-echo "ULTIMATE SYSTEM READY!"
+echo "✅ Build complete!"
