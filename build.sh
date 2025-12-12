@@ -1,14 +1,19 @@
-#!/bin/bash               # "Hey computer, run these as instructions"
-set -e                    # "Stop if anything goes wrong"
-
-echo "Installing MeCab..."  # "Print this message to screen"
-apt-get update            # "Update the list of available software"
-apt-get install -y mecab libmecab-dev mecab-ipadic-utf8  # "Install MeCab"
-
-echo "Installing Python packages..."  # "Print this message"
-pip install -r requirements.txt       # "Install Python packages from requirements.txt"
-
-echo "Downloading dictionary..."      # "Print this message"
-python -c "import unidic_lite; unidic_lite.download()"  # "Download Japanese dictionary"
-
-echo "Done!"              # "Print 'Done!' when finished"
+@app.get("/debug_conversion")
+async def debug_conversion(text: str):
+    """Debug a specific line to see detailed breakdown"""
+    analysis = mecab_analyze_line_improved(text, tagger, kakasi_converter, DICTIONARY_TYPE)
+    romaji = mecab_to_romaji_perfect_v2(text, tagger, kakasi_converter, DICTIONARY_TYPE)
+    
+    return {
+        "input": text,
+        "final_romaji": romaji,
+        "word_by_word": [
+            {
+                "japanese": w.surface,
+                "reading": w.reading,
+                "romaji": w.romaji,
+                "pos": w.pos
+            } for w in analysis
+        ],
+        "dict_type": DICTIONARY_TYPE
+    }
