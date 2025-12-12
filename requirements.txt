@@ -1,5 +1,5 @@
 fastapi
-uvicorn
+uvicorn[standard]
 requests
 openai
 beautifulsoup4
@@ -7,6 +7,5 @@ redis
 pykakasi
 jaconv
 fugashi
-mecab-python3
 unidic-lite
-
+ipadic
