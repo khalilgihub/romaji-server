@@ -1,19 +1,21 @@
-@app.get("/debug_conversion")
-async def debug_conversion(text: str):
-    """Debug a specific line to see detailed breakdown"""
-    analysis = mecab_analyze_line_improved(text, tagger, kakasi_converter, DICTIONARY_TYPE)
-    romaji = mecab_to_romaji_perfect_v2(text, tagger, kakasi_converter, DICTIONARY_TYPE)
-    
-    return {
-        "input": text,
-        "final_romaji": romaji,
-        "word_by_word": [
-            {
-                "japanese": w.surface,
-                "reading": w.reading,
-                "romaji": w.romaji,
-                "pos": w.pos
-            } for w in analysis
-        ],
-        "dict_type": DICTIONARY_TYPE
-    }
+#!/bin/bash
+set -e
+
+echo "🔧 Installing MeCab..."
+apt-get update
+apt-get install -y mecab libmecab-dev mecab-ipadic-utf8
+
+echo "🐍 Installing Python dependencies..."
+pip install --upgrade pip
+pip install -r requirements.txt
+
+echo "📚 Downloading dictionaries..."
+python3 << 'EOF'
+try:
+    import unidic_lite
+    print("✅ UniDic-Lite ready")
+except:
+    print("⚠️ UniDic-Lite not available")
+EOF
+
+echo "✅ Build complete!"
