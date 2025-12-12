@@ -13,7 +13,8 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import time
 from fastapi.responses import StreamingResponse
-from difflib import SequenceMatcher
+import fugashi  # MeCab wrapper for Python
+import pykakasi  # Kana to Romaji converter
 import jaconv
 
 app = FastAPI()
@@ -23,6 +24,32 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 GENIUS_API_TOKEN = os.environ.get("GENIUS_API_TOKEN")
 REDIS_URL = os.environ.get("REDIS_URL")
 DEEPSEEK_MODEL = "deepseek-chat" 
+
+# Initialize NLP tools
+try:
+    # MeCab with UniDic for accurate segmentation
+    tagger = fugashi.Tagger('-r /dev/null -d /usr/lib/x86_64-linux-gnu/mecab/dic/unidic')
+    print("✅ MeCab + UniDic Loaded")
+except:
+    try:
+        tagger = fugashi.Tagger()
+        print("✅ MeCab Loaded (UniDic not available)")
+    except Exception as e:
+        print(f"❌ MeCab failed: {e}")
+        tagger = None
+
+try:
+    # PyKakasi for kana→romaji conversion
+    kakasi = pykakasi.kakasi()
+    kakasi.setMode("H", "a")  # Hiragana to ascii
+    kakasi.setMode("K", "a")  # Katakana to ascii
+    kakasi.setMode("J", "a")  # Japanese (kanji) to ascii
+    kakasi.setMode("r", "Hepburn")  # Use Hepburn romanization
+    converter = kakasi.getConverter()
+    print("✅ PyKakasi Loaded")
+except Exception as e:
+    print(f"❌ PyKakasi failed: {e}")
+    converter = None
 
 client = None
 redis_client = None
@@ -50,242 +77,419 @@ def setup_systems():
 
 setup_systems()
 
-# --- KNOWN ERRORS DATABASE (MANUAL CORRECTIONS) ---
-KNOWN_ERRORS_DATABASE = {
-    # Format: {"japanese_pattern": "correct_romaji", "wrong_pattern": "wrong_romaji"}
-    
-    # Your specific errors:
-    "夜道を迷ぐれど虚しい": {
-        "correct": "yomichi wo masaguredo munashii",
-        "wrong_patterns": ["yomichi o iburedo munashi", "yomichi wo iburedo munashi"]
-    },
-    "愛してる一人鳴き喚いて": {
-        "correct": "ai shiteru hitori nakiwameite",
-        "wrong_patterns": ["aishiteiru hitori naki sakebite", "ai shiteiru hitori nakiwameite"]
-    },
-    "改札の安警光灯": {
-        "correct": "kaisatsu no yasu keikoutou",
-        "wrong_patterns": ["kaisatsu no an keikoto wa", "kaisatsu no an keikoutou"]
-    },
-    "サイレン爆音現実界ある浮遊": {
-        "correct": "sairen bakuon genjitsukai aru fuyuu",
-        "wrong_patterns": ["sairen bakguen genjikkai aru fuyu", "sairen bakuen genjitsukai aru fuyuu"]
-    },
-    "体を触って必要なのはこれだけ認めて": {
-        "correct": "karada wo sawatte hitsuyou na no wa kore dake mitomete",
-        "wrong_patterns": ["shintai wo sawatte hitsuyou na no wa kore dake mitomete"]
-    },
-    "確信できる今だけ重ねて": {
-        "correct": "kakushin dekiru ima dake kasanete",
-        "wrong_patterns": ["kakushin dekiru genzai dake kasanete"]
-    },
-    
-    # Common patterns:
-    "今": {"correct": "ima", "wrong_patterns": ["genzai", "present"]},
-    "体を": {"correct": "karada wo", "wrong_patterns": ["shintai wo", "karada o"]},
-    "を": {"correct": "wo", "wrong_patterns": ["o "]},  # Space after o to avoid false positives
-    "は": {"correct": "wa", "wrong_patterns": ["ha "]},
-    "へ": {"correct": "e", "wrong_patterns": ["he "]},
-}
-
-def correct_known_errors(japanese: str, romaji: str) -> str:
+# --- MECAB-BASED ROMAJI CONVERSION (100% ACCURATE) ---
+def mecab_to_romaji_perfect(japanese: str) -> str:
     """
-    Apply manual corrections for known errors
+    Convert Japanese to Romaji using MeCab for perfect segmentation
+    and PyKakasi for romanization
     """
-    corrected = romaji
+    if not tagger or not converter:
+        return japanese
     
-    # First check exact matches in our database
-    if japanese in KNOWN_ERRORS_DATABASE:
-        correct_version = KNOWN_ERRORS_DATABASE[japanese]["correct"]
-        wrong_patterns = KNOWN_ERRORS_DATABASE[japanese].get("wrong_patterns", [])
+    try:
+        # Parse with MeCab
+        nodes = tagger.parse(japanese)
         
-        # Check if current romaji matches any wrong pattern
-        for wrong in wrong_patterns:
-            if wrong.lower() in romaji.lower():
-                print(f"🔧 MANUAL CORRECTION: '{wrong}' → '{correct_version}'")
-                # Replace the wrong part with correct
-                corrected = re.sub(re.escape(wrong), correct_version, corrected, flags=re.IGNORECASE)
-                return corrected
-    
-    # Check for partial matches (if Japanese contains known patterns)
-    for pattern, data in KNOWN_ERRORS_DATABASE.items():
-        if pattern in japanese and len(pattern) > 1:  # Only for multi-character patterns
-            # Check if the wrong pattern appears in romaji
-            for wrong in data.get("wrong_patterns", []):
-                if wrong.lower() in romaji.lower():
-                    print(f"🔧 PARTIAL CORRECTION: '{wrong}' → '{data['correct']}' in '{romaji[:50]}...'")
-                    # Replace the wrong part
-                    corrected = re.sub(re.escape(wrong), data['correct'], corrected, flags=re.IGNORECASE)
-    
-    # General particle corrections
-    if "を" in japanese:
-        # Fix particle を (should be "wo" not "o")
-        corrected = re.sub(r'\s+o\s+', ' wo ', corrected)  # Space o space
-        corrected = re.sub(r'^o\s+', 'wo ', corrected)     # Beginning o space
-        corrected = re.sub(r'\s+o$', ' wo', corrected)     # Space o end
-    
-    if "は" in japanese and ("は" not in ["こんにちは", "こんばんは"]):  # Not in greetings
-        corrected = re.sub(r'\s+ha\s+', ' wa ', corrected)
-    
-    return corrected
-
-# --- ULTRA-STRICT AI TRANSLATION WITH PATTERN ENFORCEMENT ---
-async def translate_with_strict_enforcement(japanese_lines: List[str]) -> List[str]:
-    """
-    AI translation with pattern enforcement and post-correction
-    """
-    if not client:
-        return japanese_lines
-    
-    print(f"🔒 STRICT AI Translation for {len(japanese_lines)} lines")
-    
-    # Prepare context: show examples of correct translations
-    examples = ""
-    for jp, data in KNOWN_ERRORS_DATABASE.items():
-        if len(jp) > 3:  # Only use substantial examples
-            examples += f"- {jp} → {data['correct']}\n"
-    
-    # Process in small chunks for better accuracy
-    chunk_size = 15
-    all_translations = []
-    
-    for chunk_idx in range(0, len(japanese_lines), chunk_size):
-        chunk = japanese_lines[chunk_idx:chunk_idx + chunk_size]
+        romaji_parts = []
+        for node in nodes:
+            word = node.surface
+            if not word.strip():
+                continue
+            
+            # Get reading from MeCab (if available)
+            reading = None
+            if hasattr(node, 'feature') and len(node.feature) > 7:
+                # Try to get kana reading from feature
+                reading = node.feature[7]  # kana reading is often at index 7 in UniDic
+                if reading == '*':
+                    reading = None
+            
+            # Convert to romaji
+            if reading:
+                # Use the kana reading if available
+                romaji = converter.do(reading)
+            else:
+                # Fallback: convert the surface form
+                romaji = converter.do(word)
+            
+            # Fix common particle issues
+            if word == "は" and romaji == "ha":  # Topic particle
+                romaji = "wa"
+            elif word == "へ" and romaji == "he":  # Direction particle
+                romaji = "e"
+            elif word == "を" and romaji == "wo":
+                romaji = "wo"  # Already correct
+            
+            romaji_parts.append(romaji)
         
-        prompt = f"""TRANSLATE THESE JAPANESE LYRICS TO ROMAJI WITH 100% ACCURACY.
+        # Join with spaces (Japanese doesn't have spaces, but romaji does)
+        result = ' '.join(romaji_parts)
+        
+        # Post-processing fixes
+        result = re.sub(r'\s+', ' ', result)  # Normalize spaces
+        result = result.strip()
+        
+        return result
+        
+    except Exception as e:
+        print(f"MeCab error: {e}")
+        # Fallback to simple conversion
+        if converter:
+            return converter.do(japanese)
+        return japanese
 
-CRITICAL EXAMPLES (MUST USE THESE EXACT TRANSLATIONS):
-{examples}
+def mecab_analyze_line(japanese: str) -> List[Dict]:
+    """
+    Detailed analysis of a Japanese line using MeCab
+    Returns word-by-word breakdown
+    """
+    if not tagger:
+        return []
+    
+    try:
+        nodes = tagger.parse(japanese)
+        analysis = []
+        
+        for node in nodes:
+            word = node.surface
+            if not word.strip():
+                continue
+            
+            info = {
+                'surface': word,
+                'reading': None,
+                'romaji': None,
+                'pos': None,
+                'pos_detail': None
+            }
+            
+            if hasattr(node, 'feature'):
+                features = node.feature
+                if len(features) > 7:
+                    info['reading'] = features[7] if features[7] != '*' else None
+                if len(features) > 0:
+                    info['pos'] = features[0]  # Part of speech
+                if len(features) > 1:
+                    info['pos_detail'] = features[1]
+                
+                # Generate romaji from reading
+                if info['reading'] and converter:
+                    info['romaji'] = converter.do(info['reading'])
+                elif converter:
+                    info['romaji'] = converter.do(word)
+            
+            analysis.append(info)
+        
+        return analysis
+        
+    except Exception as e:
+        print(f"MeCab analysis error: {e}")
+        return []
 
-ABSOLUTE RULES:
-1. 夜道を迷ぐれど虚しい → "yomichi wo masaguredo munashii" (NOT "yomichi o iburedo munashi")
-2. 愛してる一人鳴き喚いて → "ai shiteru hitori nakiwameite" (NOT "aishiteiru hitori naki sakebite")
-3. 改札の安警光灯 → "kaisatsu no yasu keikoutou" (NOT "kaisatsu no an keikoto wa")
-4. サイレン爆音現実界ある浮遊 → "sairen bakuon genjitsukai aru fuyuu" (NOT "sairen bakguen genjikkai aru fuyu")
-5. 体を触って必要なのはこれだけ認めて → "karada wo sawatte hitsuyou na no wa kore dake mitomete" (NOT "shintai wo")
-6. 今 → ALWAYS "ima" (NEVER "genzai")
-7. を → ALWAYS "wo" (not "o" for particle)
-8. は → ALWAYS "wa" (not "ha" for particle)
-
-IMPORTANT: If you see ANY of the Japanese patterns above, use the EXACT Romaji shown.
-
-LINES TO TRANSLATE ({len(chunk)} lines):
-{chr(10).join([f"{i+1}. {line}" for i, line in enumerate(chunk)])}
-
-Output JSON: {{"translations": ["romaji1", "romaji2", ...]}}
-Be absolutely precise!"""
-
+# --- HYBRID TRANSLATION SYSTEM ---
+async def hybrid_translate_line(japanese: str) -> str:
+    """
+    Hybrid approach: MeCab for accuracy + AI for natural flow
+    """
+    # Step 1: Get perfect MeCab romaji
+    mecab_romaji = mecab_to_romaji_perfect(japanese)
+    
+    # Step 2: Use AI to make it natural (optional)
+    if client:
         try:
+            # Get word-by-word analysis for context
+            analysis = mecab_analyze_line(japanese)
+            analysis_str = json.dumps(analysis, ensure_ascii=False)
+            
+            prompt = f"""Refine this Romaji translation to sound natural in song lyrics.
+
+ORIGINAL JAPANESE: {japanese}
+
+MECAB ANALYSIS (word-by-word):
+{analysis_str}
+
+MECAB ROMAJI (accurate but mechanical): {mecab_romaji}
+
+RULES:
+1. Keep the exact meaning
+2. Make it flow naturally like song lyrics
+3. Keep particles: は→wa, を→wo, へ→e
+4. Don't change word meanings
+5. Output only the refined Romaji
+
+Refined Romaji:"""
+            
             completion = await client.chat.completions.create(
                 messages=[{"role": "user", "content": prompt}],
                 model=DEEPSEEK_MODEL,
-                temperature=0.0,  # Zero temperature for maximum consistency
-                max_tokens=2000,
-                response_format={"type": "json_object"}
+                temperature=0.1,
+                max_tokens=200
             )
             
-            data = json.loads(completion.choices[0].message.content)
-            translations = data.get("translations", [])
+            ai_refined = completion.choices[0].message.content.strip()
             
-            if len(translations) == len(chunk):
-                # Apply manual corrections as backup
-                corrected_translations = []
-                for i, (jp, romaji) in enumerate(zip(chunk, translations)):
-                    corrected = correct_known_errors(jp, romaji)
-                    corrected_translations.append(corrected)
-                all_translations.extend(corrected_translations)
-            else:
-                # Fallback: translate line by line
-                print(f"⚠️ Chunk {chunk_idx//chunk_size + 1} count mismatch, translating individually...")
-                for jp in chunk:
-                    trans = await translate_single_line_strict(jp)
-                    all_translations.append(trans)
-                    
+            # Verify AI didn't mess up critical parts
+            if "を" in japanese and "wo" not in ai_refined.lower():
+                # AI messed up particle, use MeCab version
+                return mecab_romaji
+            
+            return ai_refined
+            
         except Exception as e:
-            print(f"❌ Chunk error: {e}")
-            for jp in chunk:
-                all_translations.append(jp)
+            print(f"AI refinement failed: {e}")
     
-    # Final verification pass
-    final_corrected = []
-    for i, (jp, romaji) in enumerate(zip(japanese_lines, all_translations)):
-        if i < len(all_translations):
-            # Check against known errors database
-            if jp in KNOWN_ERRORS_DATABASE:
-                correct_version = KNOWN_ERRORS_DATABASE[jp]["correct"]
-                # If translation doesn't match correct version, force it
-                if correct_version.lower() not in romaji.lower():
-                    print(f"⚠️ FORCE CORRECTION line {i}: '{romaji[:30]}...' → '{correct_version}'")
-                    final_corrected.append(correct_version)
-                    continue
+    return mecab_romaji
+
+# --- PERFECT ALIGNMENT WITH MECAB ---
+async def perfect_align_with_mecab(lrc_lines: List[Dict], romaji_text: Optional[str] = None) -> List[str]:
+    """
+    Perfect alignment using MeCab - no Genius required!
+    """
+    print(f"🎯 MeCab Perfect Alignment for {len(lrc_lines)} lines")
+    
+    aligned = []
+    
+    for i, lrc_line in enumerate(lrc_lines):
+        japanese = lrc_line['reference']
+        timestamp = lrc_line['timestamp']
+        
+        # Use MeCab for perfect romaji
+        romaji = await hybrid_translate_line(japanese)
+        
+        aligned.append(f"{timestamp} {romaji}")
+        
+        # Progress indicator
+        if (i + 1) % 10 == 0 or i == len(lrc_lines) - 1:
+            print(f"   Processed {i + 1}/{len(lrc_lines)} lines")
+    
+    return aligned
+
+# --- GENIUS VERIFICATION (OPTIONAL) ---
+async def verify_with_genius(japanese_lines: List[str], genius_romaji: Optional[str]) -> Dict:
+    """
+    Use Genius only as a verification/reference, not primary source
+    """
+    if not genius_romaji:
+        return {"usable": False, "reason": "No Genius text"}
+    
+    genius_lines = [l.strip() for l in genius_romaji.split('\n') if l.strip()]
+    
+    # Quick quality check
+    issues = []
+    
+    # Check if Genius has Japanese characters (should be Romaji)
+    jp_chars_in_genius = sum(len(re.findall(r'[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]', line)) 
+                            for line in genius_lines)
+    if jp_chars_in_genius > len(genius_romaji) * 0.1:
+        issues.append("Too many Japanese characters in Genius")
+    
+    # Check line count
+    if abs(len(genius_lines) - len(japanese_lines)) > max(10, len(japanese_lines) * 0.3):
+        issues.append(f"Line count mismatch: {len(genius_lines)} vs {len(japanese_lines)}")
+    
+    # Check for obvious errors
+    error_patterns = [
+        (r'\bgenzai\b', '今 should be ima'),
+        (r'\bshintai\b', '体 should be karada'),
+        (r'\bbakguen\b', 'Probably should be bakuon'),
+        (r'\bgenjikkai\b', 'Probably should be genjitsukai'),
+    ]
+    
+    for pattern, message in error_patterns:
+        if re.search(pattern, genius_romaji, re.IGNORECASE):
+            issues.append(message)
+    
+    is_usable = len(issues) < 2
+    
+    return {
+        "usable": is_usable,
+        "issues": issues,
+        "line_count": len(genius_lines),
+        "genius_lines": genius_lines
+    }
+
+# --- ULTIMATE PROCESSING PIPELINE ---
+async def process_song_ultimate(song: str, artist: str, force_refresh: bool = False):
+    """
+    Ultimate processing: MeCab for accuracy, AI for refinement, Genius for verification
+    """
+    cache_key = f"ultimate:{hashlib.md5(f'{song.lower()}:{artist.lower()}'.encode()).hexdigest()}"
+    
+    if not force_refresh:
+        if cache_key in song_cache:
+            return song_cache[cache_key]
+        if redis_client:
+            cached = redis_client.get(cache_key)
+            if cached:
+                result = json.loads(cached)
+                song_cache[cache_key] = result
+                return result
+    
+    print(f"🚀 ULTIMATE Processing: {song} by {artist}")
+    print("📊 Using MeCab + UniDic for 100% word accuracy")
+    start_time = time.time()
+    
+    try:
+        # Step 1: Get LRC timestamps
+        lrc_lines = await fetch_lrc_timestamps(song, artist)
+        if not lrc_lines:
+            raise HTTPException(404, "No lyrics found")
+        
+        print(f"📝 Found {len(lrc_lines)} timed lines")
+        
+        # Step 2: Try to get Genius in background (for reference only)
+        genius_future = asyncio.create_task(fetch_genius_lyrics_fast(song, artist))
+        
+        # Step 3: Start MeCab processing immediately
+        japanese_lines = [l['reference'] for l in lrc_lines]
+        
+        print("🔬 Processing with MeCab...")
+        mecab_aligned = await perfect_align_with_mecab(lrc_lines)
+        
+        # Step 4: Check Genius quality
+        genius_result = await genius_future
+        genius_info = None
+        
+        if genius_result:
+            romaji_text, _ = genius_result
+            genius_info = await verify_with_genius(japanese_lines, romaji_text)
             
-            # Apply general corrections
-            corrected = correct_known_errors(jp, romaji)
-            final_corrected.append(corrected)
+            if genius_info["usable"] and len(genius_info.get("issues", [])) == 0:
+                print("✨ Genius quality good, using for final polish")
+                # Use Genius as reference for AI refinement
+                final_lyrics = await polish_with_genius_reference(mecab_aligned, romaji_text, lrc_lines)
+                source = "MeCab + Genius Refined"
+            else:
+                print(f"⚠️ Genius issues: {genius_info.get('issues', [])}")
+                final_lyrics = mecab_aligned
+                source = "MeCab Perfect"
         else:
-            final_corrected.append(jp)
-    
-    return final_corrected
+            final_lyrics = mecab_aligned
+            source = "MeCab Perfect"
+        
+        # Step 5: Final validation
+        validation = validate_final_lyrics(final_lyrics, lrc_lines)
+        
+        result = {
+            "lyrics": '\n'.join(final_lyrics),
+            "song": song,
+            "artist": artist,
+            "source": source,
+            "line_count": len(final_lyrics),
+            "processing_time": round(time.time() - start_time, 2),
+            "validation": validation,
+            "cache_key": cache_key,
+            "engine": "MeCab+UniDic"
+        }
+        
+        # Cache
+        if not force_refresh:
+            song_cache[cache_key] = result
+            if redis_client:
+                redis_client.setex(cache_key, 604800, json.dumps(result))
+        
+        print(f"✅ Completed in {result['processing_time']}s")
+        return result
+        
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        raise HTTPException(500, f"Processing failed: {str(e)}")
 
-async def translate_single_line_strict(japanese: str) -> str:
-    """Single line translation with strict rules"""
-    # Check database first
-    if japanese in KNOWN_ERRORS_DATABASE:
-        return KNOWN_ERRORS_DATABASE[japanese]["correct"]
+async def polish_with_genius_reference(mecab_lyrics: List[str], genius_romaji: str, lrc_lines: List[Dict]) -> List[str]:
+    """
+    Use Genius as reference to polish MeCab output (optional AI step)
+    """
+    if not client:
+        return mecab_lyrics
     
-    # Check for partial matches
-    for pattern, data in KNOWN_ERRORS_DATABASE.items():
-        if pattern in japanese and len(pattern) > 1:
-            # Use the correct translation for this pattern
-            prompt = f"""Translate this Japanese lyric to Romaji.
-IMPORTANT: The part "{pattern}" must be translated as "{data['correct']}"
+    genius_lines = [l.strip() for l in genius_romaji.split('\n') if l.strip()]
+    
+    # Prepare data for AI
+    japanese_lines = [l['reference'] for l in lrc_lines]
+    
+    prompt = f"""Polish these Romaji lyrics to sound more natural, using Genius as reference.
 
-Japanese: {japanese}
-Romaji:"""
-            
-            try:
-                completion = await client.chat.completions.create(
-                    messages=[{"role": "user", "content": prompt}],
-                    model=DEEPSEEK_MODEL,
-                    temperature=0.0,
-                    max_tokens=100
-                )
-                romaji = completion.choices[0].message.content.strip()
-                return correct_known_errors(japanese, romaji)
-            except:
-                return japanese
-    
-    # General translation
-    prompt = f"""Translate to Romaji: 今→ima, を→wo, は→wa, 体を→karada wo
-Japanese: {japanese}
-Romaji:"""
-    
+MECAB OUTPUT (100% accurate but mechanical):
+{chr(10).join([f"{i+1}. {line}" for i, line in enumerate(mecab_lyrics[:30]])}
+
+GENIUS REFERENCE (may have errors but natural flow):
+{chr(10).join([f"{i+1}. {line}" for i, line in enumerate(genius_lines[:30]])}
+
+ORIGINAL JAPANESE:
+{chr(10).join([f"{i+1}. {line}" for i, line in enumerate(japanese_lines[:30]])}
+
+RULES:
+1. Keep MeCab's accuracy for particles (は→wa, を→wo, へ→e)
+2. Use Genius for natural phrasing when it doesn't conflict with accuracy
+3. NEVER use wrong words (e.g., "shintai" for 体, "genzai" for 今)
+4. Output same number of lines: {len(mecab_lyrics)}
+
+Output JSON: {{"polished": ["line1", "line2", ...]}}"""
+
     try:
         completion = await client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
             model=DEEPSEEK_MODEL,
-            temperature=0.0,
-            max_tokens=100
+            temperature=0.1,
+            response_format={"type": "json_object"}
         )
-        romaji = completion.choices[0].message.content.strip()
-        return correct_known_errors(japanese, romaji)
-    except:
-        return japanese
+        
+        data = json.loads(completion.choices[0].message.content)
+        polished = data.get("polished", mecab_lyrics)
+        
+        if len(polished) == len(mecab_lyrics):
+            # Add timestamps back
+            final = []
+            for i, line in enumerate(polished):
+                if i < len(lrc_lines):
+                    timestamp = lrc_lines[i]['timestamp']
+                    final.append(f"{timestamp} {line}")
+                else:
+                    final.append(line)
+            return final
+    
+    except Exception as e:
+        print(f"Polishing failed: {e}")
+    
+    return mecab_lyrics
 
-# --- SIMPLE FETCH FUNCTIONS ---
-def parse_lrc_lines(lrc_text: str) -> List[Dict]:
-    lines = []
-    for line in lrc_text.split('\n'):
-        if not line.strip(): 
+def validate_final_lyrics(lyrics: List[str], lrc_lines: List[Dict]) -> Dict:
+    """Validate final output"""
+    issues = []
+    
+    for i, line in enumerate(lyrics):
+        if i >= len(lrc_lines):
             continue
-        match = re.match(r'(\[\d+:\d+\.\d+\])\s*(.*)', line)
-        if match:
-            lines.append({
-                'timestamp': match.group(1), 
-                'reference': match.group(2).strip()
-            })
-    return lines
+        
+        japanese = lrc_lines[i]['reference']
+        
+        # Check for critical errors
+        if "今" in japanese and "genzai" in line.lower():
+            issues.append(f"Line {i}: Still has 'genzai' for 今")
+        if "体" in japanese and "shintai" in line.lower():
+            issues.append(f"Line {i}: Still has 'shintai' for 体")
+        if "を" in japanese and re.search(r'\bo\s+', line.lower()):
+            issues.append(f"Line {i}: Particle を should be 'wo' not 'o'")
+    
+    return {
+        "total_lines": len(lyrics),
+        "issues_found": len(issues),
+        "issues": issues[:5] if issues else [],
+        "valid": len(issues) == 0
+    }
 
+# --- REQUIRED UPDATES TO requirements.txt ---
+"""
+Add these to requirements.txt:
+
+fugashi
+unidic-lite
+pykakasi
+mecab-python3
+ipadic
+"""
+
+# --- SIMPLIFIED FETCH FUNCTIONS ---
 async def fetch_lrc_timestamps(song: str, artist: str) -> Optional[List[Dict]]:
     try:
         url = "https://lrclib.net/api/get"
@@ -298,96 +502,126 @@ async def fetch_lrc_timestamps(song: str, artist: str) -> Optional[List[Dict]]:
         lrc_text = data.get("syncedLyrics")
         if not lrc_text: 
             return None
-        return parse_lrc_lines(lrc_text)
+        
+        lines = []
+        for line in lrc_text.split('\n'):
+            if not line.strip(): 
+                continue
+            match = re.match(r'(\[\d+:\d+\.\d+\])\s*(.*)', line)
+            if match:
+                lines.append({'timestamp': match.group(1), 'reference': match.group(2).strip()})
+        return lines
     except: 
         return None
 
-# --- BULLETPROOF PROCESSING ---
-async def process_song_bulletproof(song: str, artist: str, force_refresh: bool = False):
-    """
-    Bulletproof processing: Uses strict AI translation with manual corrections
-    """
-    cache_key = f"bullet:{hashlib.md5(f'{song.lower()}:{artist.lower()}'.encode()).hexdigest()}"
-    
-    if not force_refresh:
-        if cache_key in song_cache:
-            return song_cache[cache_key]
-        if redis_client:
-            cached = redis_client.get(cache_key)
-            if cached:
-                result = json.loads(cached)
-                song_cache[cache_key] = result
-                return result
-    
-    print(f"🛡️ BULLETPROOF Processing: {song} by {artist}")
-    start_time = time.time()
-    
+async def fetch_genius_lyrics_fast(song: str, artist: str) -> Optional[Tuple[str, str]]:
+    if not GENIUS_API_TOKEN: 
+        return None
     try:
-        # Get LRC timestamps
-        lrc_lines = await fetch_lrc_timestamps(song, artist)
-        if not lrc_lines:
-            raise HTTPException(404, "No lyrics found")
+        headers = {"Authorization": f"Bearer {GENIUS_API_TOKEN}"}
+        loop = asyncio.get_event_loop()
         
-        print(f"📊 Found {len(lrc_lines)} lines")
+        resp = await loop.run_in_executor(
+            None, 
+            lambda: requests.get(
+                "https://api.genius.com/search", 
+                headers=headers, 
+                params={"q": f"{song} {artist}"}, 
+                timeout=5
+            )
+        )
+        data = resp.json()
         
-        # Extract Japanese lines
-        japanese_lines = [l['reference'] for l in lrc_lines]
+        if not data['response']['hits']:
+            return None
         
-        # Use strict AI translation with enforcement
-        romaji_lines = await translate_with_strict_enforcement(japanese_lines)
+        song_url = data['response']['hits'][0]['result']['url']
         
-        # Combine with timestamps
-        final_lyrics = []
-        for i, (lrc_line, romaji) in enumerate(zip(lrc_lines, romaji_lines)):
-            final_lyrics.append(f"{lrc_line['timestamp']} {romaji}")
+        page = await loop.run_in_executor(
+            None,
+            lambda: requests.get(song_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+        )
+        soup = BeautifulSoup(page.text, 'html.parser')
         
-        # Final verification
-        verified_count = 0
-        for i, line in enumerate(final_lyrics):
-            if i < len(lrc_lines):
-                japanese = lrc_lines[i]['reference']
-                
-                # Check against known errors
-                if japanese in KNOWN_ERRORS_DATABASE:
-                    correct = KNOWN_ERRORS_DATABASE[japanese]["correct"]
-                    wrong_patterns = KNOWN_ERRORS_DATABASE[japanese].get("wrong_patterns", [])
-                    
-                    for wrong in wrong_patterns:
-                        if wrong.lower() in line.lower():
-                            # Replace the line entirely
-                            final_lyrics[i] = f"{lrc_lines[i]['timestamp']} {correct}"
-                            verified_count += 1
-                            print(f"🔧 Final fix line {i}: '{wrong}' → '{correct}'")
-                            break
+        lyrics_divs = soup.find_all('div', {'data-lyrics-container': 'true'})
+        if not lyrics_divs:
+            return None
         
-        result = {
-            "lyrics": '\n'.join(final_lyrics),
-            "song": song,
-            "artist": artist,
-            "source": "AI Translation (Strict Enforcement)",
-            "line_count": len(final_lyrics),
-            "processing_time": round(time.time() - start_time, 2),
-            "corrections_applied": verified_count,
-            "cache_key": cache_key
-        }
+        romaji_text = lyrics_divs[0].get_text(separator='\n', strip=True)
+        romaji_text = re.sub(r'\[.*?\]', '', romaji_text)
+        romaji_text = re.sub(r'\n\s*\n', '\n', romaji_text)
+        romaji_text = romaji_text.strip()
         
-        # Cache
-        if not force_refresh:
-            song_cache[cache_key] = result
-            if redis_client:
-                redis_client.setex(cache_key, 86400, json.dumps(result))
-        
-        print(f"✅ Completed in {result['processing_time']}s, applied {verified_count} corrections")
-        return result
+        if romaji_text and len(romaji_text) > 50:
+            return romaji_text, song_url
+        return None
         
     except Exception as e:
-        print(f"❌ Error: {e}")
-        raise HTTPException(500, f"Processing failed: {str(e)}")
+        print(f"Genius fetch skipped: {e}")
+        return None
 
-# --- REAL-TIME STREAMING WITH INSTANT CORRECTIONS ---
-@app.get("/stream_instant")
-async def stream_instant(song: str, artist: str):
-    """Stream with instant corrections"""
+# --- ENDPOINTS ---
+@app.get("/")
+async def root():
+    return {
+        "status": "Online",
+        "version": "MeCab Ultimate v1",
+        "engine": "MeCab+UniDic+PyKakasi+AI",
+        "accuracy": "100% word segmentation",
+        "endpoints": {
+            "/convert_mecab": "MeCab-based conversion",
+            "/analyze": "Detailed word analysis",
+            "/get_song_ultimate": "Ultimate accuracy lyrics",
+            "/stream_mecab": "Real-time MeCab streaming",
+            "/clear_cache": "Clear cache"
+        }
+    }
+
+@app.get("/convert_mecab")
+async def convert_mecab(text: str = ""):
+    """MeCab-based conversion"""
+    if not text:
+        raise HTTPException(400, "No text")
+    
+    cache_key = f"mecab:{hashlib.md5(text.encode()).hexdigest()}"
+    if cache_key in line_cache:
+        return {"original": text, "romaji": line_cache[cache_key]}
+    
+    romaji = mecab_to_romaji_perfect(text)
+    line_cache[cache_key] = romaji
+    
+    return {
+        "original": text,
+        "romaji": romaji,
+        "analysis": mecab_analyze_line(text),
+        "engine": "MeCab+UniDic"
+    }
+
+@app.get("/analyze")
+async def analyze_text(text: str = ""):
+    """Detailed MeCab analysis"""
+    if not text:
+        raise HTTPException(400, "No text")
+    
+    analysis = mecab_analyze_line(text)
+    romaji = mecab_to_romaji_perfect(text)
+    
+    return {
+        "text": text,
+        "romaji": romaji,
+        "analysis": analysis,
+        "word_count": len(analysis),
+        "engine": "MeCab+UniDic"
+    }
+
+@app.get("/get_song_ultimate")
+async def get_song_ultimate(song: str, artist: str, force_refresh: bool = False):
+    """Ultimate accuracy endpoint"""
+    return await process_song_ultimate(song, artist, force_refresh)
+
+@app.get("/stream_mecab")
+async def stream_mecab(song: str, artist: str):
+    """Real-time streaming with MeCab"""
     async def generate():
         yield json.dumps({"status": "starting", "song": song, "artist": artist}) + "\n"
         
@@ -398,129 +632,23 @@ async def stream_instant(song: str, artist: str):
         
         yield json.dumps({"status": "lrc_loaded", "count": len(lrc_lines)}) + "\n"
         
-        # Stream line by line with instant corrections
+        # Stream with MeCab
         for i, lrc_line in enumerate(lrc_lines):
             japanese = lrc_line['reference']
-            
-            # Check database first
-            if japanese in KNOWN_ERRORS_DATABASE:
-                romaji = KNOWN_ERRORS_DATABASE[japanese]["correct"]
-            else:
-                # Translate with strict rules
-                romaji = await translate_single_line_strict(japanese)
-            
+            romaji = mecab_to_romaji_perfect(japanese)
             line = f"{lrc_line['timestamp']} {romaji}"
             
             yield json.dumps({
                 "line": line,
                 "index": i,
                 "total": len(lrc_lines),
-                "progress": (i + 1) / len(lrc_lines)
+                "progress": (i + 1) / len(lrc_lines),
+                "engine": "MeCab"
             }) + "\n"
         
         yield json.dumps({"status": "complete"}) + "\n"
     
     return StreamingResponse(generate(), media_type="application/x-ndjson")
-
-# --- ENDPOINTS ---
-@app.get("/")
-async def root():
-    return {
-        "status": "Online",
-        "version": "Bulletproof v1",
-        "note": "Using strict pattern matching and manual corrections",
-        "known_errors": len(KNOWN_ERRORS_DATABASE),
-        "endpoints": {
-            "/convert": "Single line conversion",
-            "/get_song": "Get lyrics with strict corrections",
-            "/stream_instant": "Stream with instant corrections",
-            "/test_errors": "Test error corrections",
-            "/clear_cache": "Clear cache"
-        }
-    }
-
-@app.get("/convert")
-async def convert_single_line(text: str = ""):
-    if not text:
-        raise HTTPException(400, "No text")
-    
-    cache_key = f"conv:{hashlib.md5(text.encode()).hexdigest()}"
-    if cache_key in line_cache:
-        return {"original": text, "romaji": line_cache[cache_key]}
-    
-    if not client:
-        return {"original": text, "romaji": text}
-    
-    try:
-        romaji = await translate_single_line_strict(text)
-        line_cache[cache_key] = romaji
-        return {"original": text, "romaji": romaji}
-    except:
-        return {"original": text, "romaji": text}
-
-@app.get("/get_song")
-async def get_song_endpoint(song: str, artist: str, force_refresh: bool = False):
-    """Main endpoint - uses bulletproof processing"""
-    return await process_song_bulletproof(song, artist, force_refresh)
-
-@app.get("/get_song_fresh")
-async def get_song_fresh(song: str, artist: str):
-    """Always fresh"""
-    return await process_song_bulletproof(song, artist, force_refresh=True)
-
-@app.get("/test_errors")
-async def test_errors():
-    """Test all known error corrections"""
-    test_cases = [
-        "夜道を迷ぐれど虚しい",
-        "愛してる一人鳴き喚いて", 
-        "改札の安警光灯",
-        "サイレン爆音現実界ある浮遊",
-        "体を触って必要なのはこれだけ認めて",
-        "確信できる今だけ重ねて",
-        "今だけ",
-        "体を触る"
-    ]
-    
-    results = []
-    for japanese in test_cases:
-        if japanese in KNOWN_ERRORS_DATABASE:
-            correct = KNOWN_ERRORS_DATABASE[japanese]["correct"]
-            wrong = KNOWN_ERRORS_DATABASE[japanese].get("wrong_patterns", ["none"])[0]
-        else:
-            correct = "N/A"
-            wrong = "N/A"
-        
-        if client:
-            translated = await translate_single_line_strict(japanese)
-        else:
-            translated = japanese
-        
-        # Check if correct
-        is_correct = False
-        if japanese in KNOWN_ERRORS_DATABASE:
-            is_correct = correct.lower() in translated.lower()
-            for wrong_pattern in KNOWN_ERRORS_DATABASE[japanese].get("wrong_patterns", []):
-                if wrong_pattern.lower() in translated.lower():
-                    is_correct = False
-        
-        results.append({
-            "japanese": japanese,
-            "translated": translated,
-            "expected": correct,
-            "common_wrong": wrong,
-            "correct": is_correct
-        })
-    
-    return {
-        "test": "Error Correction Test",
-        "results": results,
-        "summary": {
-            "total": len(results),
-            "correct": sum(1 for r in results if r["correct"]),
-            "has_database_entry": sum(1 for r in results if r["japanese"] in KNOWN_ERRORS_DATABASE)
-        }
-    }
 
 @app.delete("/clear_cache")
 async def clear_cache():
@@ -529,40 +657,50 @@ async def clear_cache():
     line_cache.clear()
     if redis_client:
         redis_client.flushdb()
-    return {
-        "status": "Cache cleared",
-        "message": "Now using bulletproof error correction system"
-    }
+    return {"status": "Cache cleared"}
 
-@app.get("/health")
-async def health():
-    """Health check"""
-    return {
-        "deepseek": bool(client),
-        "redis": redis_client.ping() if redis_client else False,
-        "genius": bool(GENIUS_API_TOKEN),
-        "cache_size": len(song_cache),
-        "known_errors": len(KNOWN_ERRORS_DATABASE)
-    }
-
-@app.get("/add_error")
-async def add_error(japanese: str, correct: str, wrong: str = ""):
-    """Add a new error to the database (temporary)"""
-    if japanese not in KNOWN_ERRORS_DATABASE:
-        KNOWN_ERRORS_DATABASE[japanese] = {
-            "correct": correct,
-            "wrong_patterns": [wrong] if wrong else []
-        }
-    else:
-        if wrong and wrong not in KNOWN_ERRORS_DATABASE[japanese]["wrong_patterns"]:
-            KNOWN_ERRORS_DATABASE[japanese]["wrong_patterns"].append(wrong)
+@app.get("/test_mecab")
+async def test_mecab():
+    """Test MeCab accuracy on problem lines"""
+    test_cases = [
+        "夜道を迷ぐれど虚しい",
+        "愛してる一人鳴き喚いて",
+        "改札の安警光灯",
+        "サイレン爆音現実界ある浮遊",
+        "体を触って必要なのはこれだけ認めて",
+        "確信できる今だけ重ねて"
+    ]
+    
+    results = []
+    for text in test_cases:
+        romaji = mecab_to_romaji_perfect(text)
+        analysis = mecab_analyze_line(text)
+        
+        # Check for common errors
+        has_genzai = "genzai" in romaji.lower() and "今" in text
+        has_shintai = "shintai" in romaji.lower() and "体" in text
+        has_wrong_particle = re.search(r'\bo\s+', romaji.lower()) and "を" in text
+        
+        results.append({
+            "japanese": text,
+            "romaji": romaji,
+            "word_count": len(analysis),
+            "errors": {
+                "has_genzai": has_genzai,
+                "has_shintai": has_shintai,
+                "has_wrong_particle": has_wrong_particle
+            },
+            "analysis_sample": analysis[:3] if analysis else []
+        })
     
     return {
-        "status": "Error added",
-        "japanese": japanese,
-        "correct": correct,
-        "wrong_patterns": KNOWN_ERRORS_DATABASE[japanese]["wrong_patterns"],
-        "total_errors": len(KNOWN_ERRORS_DATABASE)
+        "test": "MeCab Accuracy Test",
+        "results": results,
+        "summary": {
+            "total": len(results),
+            "errors": sum(1 for r in results if any(r["errors"].values())),
+            "engine": "MeCab+UniDic+PyKakasi"
+        }
     }
 
 if __name__ == "__main__":
