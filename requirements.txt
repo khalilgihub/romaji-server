@@ -8,3 +8,4 @@ fugashi
 mecab-python3
 pykakasi
 jaconv
+unidic-lite
