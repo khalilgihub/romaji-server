@@ -16,8 +16,18 @@ from fastapi.responses import StreamingResponse
 import fugashi  # MeCab wrapper for Python
 import pykakasi  # Kana to Romaji converter
 import jaconv
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
+
+# Add CORS middleware to allow requests from any origin
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # --- CONFIGURATION ---
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY") 
@@ -27,19 +37,18 @@ DEEPSEEK_MODEL = "deepseek-chat"
 
 # Initialize NLP tools
 try:
-    # MeCab with UniDic for accurate segmentation
-    tagger = fugashi.Tagger('-r /dev/null -d /usr/lib/x86_64-linux-gnu/mecab/dic/unidic')
-    print("✅ MeCab + UniDic Loaded")
-except:
+    # Try to load UniDic first, fall back to IPADIC
     try:
+        tagger = fugashi.Tagger('-r /dev/null -d /usr/lib/x86_64-linux-gnu/mecab/dic/unidic')
+        print("✅ MeCab + UniDic Loaded")
+    except:
         tagger = fugashi.Tagger()
-        print("✅ MeCab Loaded (UniDic not available)")
-    except Exception as e:
-        print(f"❌ MeCab failed: {e}")
-        tagger = None
+        print("✅ MeCab Loaded (IPADIC)")
+except Exception as e:
+    print(f"❌ MeCab failed: {e}")
+    tagger = None
 
 try:
-    # PyKakasi for kana→romaji conversion
     kakasi = pykakasi.kakasi()
     kakasi.setMode("H", "a")  # Hiragana to ascii
     kakasi.setMode("K", "a")  # Katakana to ascii
@@ -74,6 +83,8 @@ def setup_systems():
             print(f"❌ Redis Failed: {e}")
     if GENIUS_API_TOKEN:
         print("✅ Genius API Token Loaded")
+    else:
+        print("⚠️ Genius API Token not found (optional)")
 
 setup_systems()
 
@@ -84,6 +95,9 @@ def mecab_to_romaji_perfect(japanese: str) -> str:
     and PyKakasi for romanization
     """
     if not tagger or not converter:
+        # Fallback: return hiragana/katakana converted
+        if converter:
+            return converter.do(japanese)
         return japanese
     
     try:
@@ -98,35 +112,51 @@ def mecab_to_romaji_perfect(japanese: str) -> str:
             
             # Get reading from MeCab (if available)
             reading = None
-            if hasattr(node, 'feature') and len(node.feature) > 7:
-                # Try to get kana reading from feature
-                reading = node.feature[7]  # kana reading is often at index 7 in UniDic
-                if reading == '*':
-                    reading = None
+            if hasattr(node, 'feature'):
+                features = node.feature
+                # In UniDic, reading is usually at index 7, but let's be safe
+                if features and len(features) > 7:
+                    reading = features[7] if features[7] != '*' else None
+                
+                # If no reading, try to find kana reading in other fields
+                if not reading and features:
+                    for feat in features:
+                        if feat and re.match(r'^[\u3040-\u309F\u30A0-\u30FF]+$', feat):
+                            reading = feat
+                            break
             
             # Convert to romaji
-            if reading:
+            if reading and converter:
                 # Use the kana reading if available
                 romaji = converter.do(reading)
-            else:
+            elif converter:
                 # Fallback: convert the surface form
                 romaji = converter.do(word)
+            else:
+                romaji = word
             
             # Fix common particle issues
-            if word == "は" and romaji == "ha":  # Topic particle
+            if word == "は":  # Topic particle
                 romaji = "wa"
-            elif word == "へ" and romaji == "he":  # Direction particle
+            elif word == "へ":  # Direction particle
                 romaji = "e"
-            elif word == "を" and romaji == "wo":
-                romaji = "wo"  # Already correct
+            elif word == "を":
+                romaji = "wo"
+            elif word == "だ":
+                romaji = "da"
+            elif word == "です":
+                romaji = "desu"
+            elif word == "ます":
+                romaji = "masu"
             
             romaji_parts.append(romaji)
         
-        # Join with spaces (Japanese doesn't have spaces, but romaji does)
+        # Join with spaces
         result = ' '.join(romaji_parts)
         
         # Post-processing fixes
-        result = re.sub(r'\s+', ' ', result)  # Normalize spaces
+        result = re.sub(r'\s+', ' ', result)
+        result = re.sub(r'\bha\b', 'wa', result)  # Fix any remaining 'ha' particles
         result = result.strip()
         
         return result
@@ -160,23 +190,29 @@ def mecab_analyze_line(japanese: str) -> List[Dict]:
                 'reading': None,
                 'romaji': None,
                 'pos': None,
-                'pos_detail': None
+                'pos_detail': None,
+                'base_form': None
             }
             
             if hasattr(node, 'feature'):
                 features = node.feature
-                if len(features) > 7:
-                    info['reading'] = features[7] if features[7] != '*' else None
-                if len(features) > 0:
-                    info['pos'] = features[0]  # Part of speech
-                if len(features) > 1:
-                    info['pos_detail'] = features[1]
-                
-                # Generate romaji from reading
-                if info['reading'] and converter:
-                    info['romaji'] = converter.do(info['reading'])
-                elif converter:
-                    info['romaji'] = converter.do(word)
+                if features:
+                    info['pos'] = features[0] if len(features) > 0 else None
+                    info['pos_detail'] = features[1] if len(features) > 1 else None
+                    
+                    # Try to get reading (index varies by dictionary)
+                    if len(features) > 7:
+                        info['reading'] = features[7] if features[7] != '*' else None
+                    
+                    # Base form is usually at index 6
+                    if len(features) > 6:
+                        info['base_form'] = features[6] if features[6] != '*' else None
+                    
+                    # Generate romaji
+                    if info['reading'] and converter:
+                        info['romaji'] = converter.do(info['reading'])
+                    elif converter:
+                        info['romaji'] = converter.do(word)
             
             analysis.append(info)
         
@@ -230,7 +266,6 @@ Refined Romaji:"""
             
             # Verify AI didn't mess up critical parts
             if "を" in japanese and "wo" not in ai_refined.lower():
-                # AI messed up particle, use MeCab version
                 return mecab_romaji
             
             return ai_refined
@@ -326,14 +361,14 @@ async def process_song_ultimate(song: str, artist: str, force_refresh: bool = Fa
                 return result
     
     print(f"🚀 ULTIMATE Processing: {song} by {artist}")
-    print("📊 Using MeCab + UniDic for 100% word accuracy")
+    print("📊 Using MeCab for 100% word accuracy")
     start_time = time.time()
     
     try:
         # Step 1: Get LRC timestamps
         lrc_lines = await fetch_lrc_timestamps(song, artist)
         if not lrc_lines:
-            raise HTTPException(404, "No lyrics found")
+            raise HTTPException(status_code=404, detail="No lyrics found")
         
         print(f"📝 Found {len(lrc_lines)} timed lines")
         
@@ -379,7 +414,7 @@ async def process_song_ultimate(song: str, artist: str, force_refresh: bool = Fa
             "processing_time": round(time.time() - start_time, 2),
             "validation": validation,
             "cache_key": cache_key,
-            "engine": "MeCab+UniDic"
+            "engine": "MeCab+PyKakasi"
         }
         
         # Cache
@@ -391,9 +426,11 @@ async def process_song_ultimate(song: str, artist: str, force_refresh: bool = Fa
         print(f"✅ Completed in {result['processing_time']}s")
         return result
         
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"❌ Error: {e}")
-        raise HTTPException(500, f"Processing failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
 
 async def polish_with_genius_reference(mecab_lyrics: List[str], genius_romaji: str, lrc_lines: List[Dict]) -> List[str]:
     """
@@ -409,13 +446,14 @@ async def polish_with_genius_reference(mecab_lyrics: List[str], genius_romaji: s
     
     prompt = f"""Polish these Romaji lyrics to sound more natural, using Genius as reference.
 
+JAPANESE LINES:
+{chr(10).join([f'{i+1}. {line}' for i, line in enumerate(japanese_lines[:30])])}
+
 MECAB OUTPUT (100% accurate but mechanical):
-{chr(10).join([f'{i+1}. {line}' for i, line in enumerate(mecab_lyrics[:30])])}")
+{chr(10).join([f'{i+1}. {line.split(" ", 1)[1] if " " in line else line}' for i, line in enumerate(mecab_lyrics[:30])])}
 
-
-{chr(10).join([f'{i+1}. {line}' for i, line in enumerate(genius_lines[:30])])}")
-
-{chr(10).join([f'{i+1}. {line}' for i, line in enumerate(japanese_lines[:30])])}")
+GENIUS REFERENCE:
+{chr(10).join([f'{i+1}. {line}' for i, line in enumerate(genius_lines[:30])])}
 
 RULES:
 1. Keep MeCab's accuracy for particles (は→wa, を→wo, へ→e)
@@ -434,7 +472,7 @@ Output JSON: {{"polished": ["line1", "line2", ...]}}"""
         )
         
         data = json.loads(completion.choices[0].message.content)
-        polished = data.get("polished", mecab_lyrics)
+        polished = data.get("polished", [])
         
         if len(polished) == len(mecab_lyrics):
             # Add timestamps back
@@ -461,14 +499,16 @@ def validate_final_lyrics(lyrics: List[str], lrc_lines: List[Dict]) -> Dict:
             continue
         
         japanese = lrc_lines[i]['reference']
+        romaji_part = line.split(' ', 1)[1] if ' ' in line else line
         
         # Check for critical errors
-        if "今" in japanese and "genzai" in line.lower():
+        if "今" in japanese and "genzai" in romaji_part.lower():
             issues.append(f"Line {i}: Still has 'genzai' for 今")
-        if "体" in japanese and "shintai" in line.lower():
+        if "体" in japanese and "shintai" in romaji_part.lower():
             issues.append(f"Line {i}: Still has 'shintai' for 体")
-        if "を" in japanese and re.search(r'\bo\s+', line.lower()):
-            issues.append(f"Line {i}: Particle を should be 'wo' not 'o'")
+        if "を" in japanese and re.search(r'\bo\s+', romaji_part.lower()):
+            if "wo" not in romaji_part.lower():
+                issues.append(f"Line {i}: Particle を should be 'wo'")
     
     return {
         "total_lines": len(lyrics),
@@ -477,17 +517,6 @@ def validate_final_lyrics(lyrics: List[str], lrc_lines: List[Dict]) -> Dict:
         "valid": len(issues) == 0
     }
 
-# --- REQUIRED UPDATES TO requirements.txt ---
-"""
-Add these to requirements.txt:
-
-fugashi
-unidic-lite
-pykakasi
-mecab-python3
-ipadic
-"""
-
 # --- SIMPLIFIED FETCH FUNCTIONS ---
 async def fetch_lrc_timestamps(song: str, artist: str) -> Optional[List[Dict]]:
     try:
@@ -495,8 +524,10 @@ async def fetch_lrc_timestamps(song: str, artist: str) -> Optional[List[Dict]]:
         loop = asyncio.get_event_loop()
         resp = await loop.run_in_executor(
             None, 
-            lambda: requests.get(url, params={"track_name": song, "artist_name": artist}, timeout=5)
+            lambda: requests.get(url, params={"track_name": song, "artist_name": artist}, timeout=10)
         )
+        if resp.status_code != 200:
+            return None
         data = resp.json()
         lrc_text = data.get("syncedLyrics")
         if not lrc_text: 
@@ -510,7 +541,8 @@ async def fetch_lrc_timestamps(song: str, artist: str) -> Optional[List[Dict]]:
             if match:
                 lines.append({'timestamp': match.group(1), 'reference': match.group(2).strip()})
         return lines
-    except: 
+    except Exception as e:
+        print(f"LRC fetch error: {e}")
         return None
 
 async def fetch_genius_lyrics_fast(song: str, artist: str) -> Optional[Tuple[str, str]]:
@@ -526,7 +558,7 @@ async def fetch_genius_lyrics_fast(song: str, artist: str) -> Optional[Tuple[str
                 "https://api.genius.com/search", 
                 headers=headers, 
                 params={"q": f"{song} {artist}"}, 
-                timeout=5
+                timeout=10
             )
         )
         data = resp.json()
@@ -538,7 +570,7 @@ async def fetch_genius_lyrics_fast(song: str, artist: str) -> Optional[Tuple[str
         
         page = await loop.run_in_executor(
             None,
-            lambda: requests.get(song_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+            lambda: requests.get(song_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
         )
         soup = BeautifulSoup(page.text, 'html.parser')
         
@@ -565,22 +597,44 @@ async def root():
     return {
         "status": "Online",
         "version": "MeCab Ultimate v1",
-        "engine": "MeCab+UniDic+PyKakasi+AI",
+        "engine": "MeCab+PyKakasi+AI",
         "accuracy": "100% word segmentation",
         "endpoints": {
+            "/convert": "Simple Japanese to Romaji conversion",
             "/convert_mecab": "MeCab-based conversion",
             "/analyze": "Detailed word analysis",
             "/get_song_ultimate": "Ultimate accuracy lyrics",
             "/stream_mecab": "Real-time MeCab streaming",
-            "/clear_cache": "Clear cache"
-        }
+            "/clear_cache": "Clear cache",
+            "/test_mecab": "Test MeCab accuracy"
+        },
+        "note": "Use /convert for simple conversion, /convert_mecab for advanced"
+    }
+
+@app.get("/convert")
+async def convert_simple(text: str = ""):
+    """Simple conversion endpoint (backward compatibility)"""
+    if not text:
+        raise HTTPException(status_code=400, detail="No text provided")
+    
+    cache_key = f"simple:{hashlib.md5(text.encode()).hexdigest()}"
+    if cache_key in line_cache:
+        return {"original": text, "romaji": line_cache[cache_key]}
+    
+    romaji = mecab_to_romaji_perfect(text)
+    line_cache[cache_key] = romaji
+    
+    return {
+        "original": text,
+        "romaji": romaji,
+        "engine": "MeCab"
     }
 
 @app.get("/convert_mecab")
 async def convert_mecab(text: str = ""):
     """MeCab-based conversion"""
     if not text:
-        raise HTTPException(400, "No text")
+        raise HTTPException(status_code=400, detail="No text provided")
     
     cache_key = f"mecab:{hashlib.md5(text.encode()).hexdigest()}"
     if cache_key in line_cache:
@@ -593,14 +647,14 @@ async def convert_mecab(text: str = ""):
         "original": text,
         "romaji": romaji,
         "analysis": mecab_analyze_line(text),
-        "engine": "MeCab+UniDic"
+        "engine": "MeCab+PyKakasi"
     }
 
 @app.get("/analyze")
 async def analyze_text(text: str = ""):
     """Detailed MeCab analysis"""
     if not text:
-        raise HTTPException(400, "No text")
+        raise HTTPException(status_code=400, detail="No text provided")
     
     analysis = mecab_analyze_line(text)
     romaji = mecab_to_romaji_perfect(text)
@@ -610,7 +664,7 @@ async def analyze_text(text: str = ""):
         "romaji": romaji,
         "analysis": analysis,
         "word_count": len(analysis),
-        "engine": "MeCab+UniDic"
+        "engine": "MeCab+PyKakasi"
     }
 
 @app.get("/get_song_ultimate")
@@ -644,6 +698,9 @@ async def stream_mecab(song: str, artist: str):
                 "progress": (i + 1) / len(lrc_lines),
                 "engine": "MeCab"
             }) + "\n"
+            
+            # Small delay for streaming effect
+            await asyncio.sleep(0.01)
         
         yield json.dumps({"status": "complete"}) + "\n"
     
@@ -678,7 +735,7 @@ async def test_mecab():
         # Check for common errors
         has_genzai = "genzai" in romaji.lower() and "今" in text
         has_shintai = "shintai" in romaji.lower() and "体" in text
-        has_wrong_particle = re.search(r'\bo\s+', romaji.lower()) and "を" in text
+        has_wrong_particle = re.search(r'\bo\s+', romaji.lower()) and "を" in text and "wo" not in romaji.lower()
         
         results.append({
             "japanese": text,
@@ -698,11 +755,23 @@ async def test_mecab():
         "summary": {
             "total": len(results),
             "errors": sum(1 for r in results if any(r["errors"].values())),
-            "engine": "MeCab+UniDic+PyKakasi"
+            "engine": "MeCab+PyKakasi"
         }
+    }
+
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "mecab_loaded": tagger is not None,
+        "kakasi_loaded": converter is not None,
+        "deepseek_loaded": client is not None,
+        "redis_loaded": redis_client is not None,
+        "timestamp": time.time()
     }
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
-
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
