@@ -809,5 +809,3 @@ async def stream_mecab(song: str, artist: str):
         yield json.dumps({"status": "complete"}) + "\n"
     
     return StreamingResponse(generate(), media_type="application/x-ndjson")
-
-@app.
