@@ -68,6 +68,7 @@ async def ai_perfect_align(lrc_lines: List[Dict], romaji_text: str) -> List[str]
     
     print(f"🤖 Using AI for perfect alignment: {len(japanese_lines)} Japanese lines vs {len(romaji_lines)} Romaji lines")
     
+    # FIXED LINE: Added missing closing bracket and parenthesis
     prompt = f"""You are a Japanese lyrics expert. Match these Japanese lyrics with the correct Romaji lyrics.
 
 CRITICAL RULES:
@@ -79,10 +80,10 @@ CRITICAL RULES:
 6. For を, use "wo" NOT "o"
 
 JAPANESE LYRICS (with line numbers):
-{chr(10).join([f"{i+1}. {line}" for i, line in enumerate(japanese_lines[:50]])}
+{chr(10).join([f"{i+1}. {line}" for i, line in enumerate(japanese_lines[:50])])}
 
 ROMAJI LYRICS (available for matching):
-{chr(10).join([f"{i+1}. {line}" for i, line in enumerate(romaji_lines[:60]])}
+{chr(10).join([f"{i+1}. {line}" for i, line in enumerate(romaji_lines[:60])])}
 
 MAPPING INSTRUCTIONS:
 - Line 1 Japanese → Line 1 Romaji (or the closest match)
@@ -432,11 +433,80 @@ Romaji:"""
     except:
         return japanese
 
-# --- REST OF YOUR CODE (keep your existing functions) ---
-# [Keep all your existing functions: fetch_lrc_timestamps, fetch_genius_lyrics, etc.]
-# Just update the main processing to use the new hybrid alignment
+# --- SIMPLIFIED VERSION OF YOUR EXISTING FUNCTIONS ---
+def parse_lrc_lines(lrc_text: str) -> List[Dict]:
+    lines = []
+    for line in lrc_text.split('\n'):
+        if not line.strip(): 
+            continue
+        match = re.match(r'(\[\d+:\d+\.\d+\])\s*(.*)', line)
+        if match:
+            lines.append({
+                'timestamp': match.group(1), 
+                'reference': match.group(2).strip()
+            })
+    return lines
 
-# --- UPDATED MAIN PROCESSING ---
+async def fetch_lrc_timestamps(song: str, artist: str) -> Optional[List[Dict]]:
+    try:
+        url = "https://lrclib.net/api/get"
+        loop = asyncio.get_event_loop()
+        resp = await loop.run_in_executor(
+            None, 
+            lambda: requests.get(url, params={"track_name": song, "artist_name": artist}, timeout=5)
+        )
+        data = resp.json()
+        lrc_text = data.get("syncedLyrics")
+        if not lrc_text: 
+            return None
+        return parse_lrc_lines(lrc_text)
+    except: 
+        return None
+
+async def fetch_genius_lyrics(song: str, artist: str) -> Optional[Tuple[str, str]]:
+    if not GENIUS_API_TOKEN: 
+        return None
+    try:
+        headers = {"Authorization": f"Bearer {GENIUS_API_TOKEN}"}
+        loop = asyncio.get_event_loop()
+        
+        resp = await loop.run_in_executor(
+            None, 
+            lambda: requests.get("https://api.genius.com/search", headers=headers, params={"q": f"{song} {artist}"}, timeout=8)
+        )
+        data = resp.json()
+        
+        if not data['response']['hits']:
+            return None
+        
+        song_url = data['response']['hits'][0]['result']['url']
+        
+        page = await loop.run_in_executor(
+            None,
+            lambda: requests.get(song_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=8)
+        )
+        soup = BeautifulSoup(page.text, 'html.parser')
+        
+        lyrics_divs = soup.find_all('div', {'data-lyrics-container': 'true'})
+        full_text = []
+        for div in lyrics_divs:
+            text = div.get_text(separator='\n', strip=True)
+            full_text.append(text)
+        
+        romaji_text = '\n\n'.join(full_text)
+        romaji_text = re.sub(r'\[.*?\]', '', romaji_text)
+        romaji_text = re.sub(r'\n\s*\n', '\n', romaji_text)
+        romaji_text = romaji_text.strip()
+        
+        if romaji_text and len(romaji_text) > 30:
+            return romaji_text, song_url
+        return None
+        
+    except Exception as e:
+        print(f"Genius error: {e}")
+        return None
+
+# --- MAIN PROCESSING ---
 async def process_song_perfect(song: str, artist: str, force_refresh: bool = False):
     """Main processing with PERFECT alignment"""
     cache_key = f"perfect:{hashlib.md5(f'{song.lower()}:{artist.lower()}'.encode()).hexdigest()}"
@@ -540,79 +610,30 @@ async def process_song_perfect(song: str, artist: str, force_refresh: bool = Fal
         print(f"❌ Error: {e}")
         raise HTTPException(500, f"Processing failed: {str(e)}")
 
-# --- ADD THESE FUNCTIONS (if not already in your code) ---
-async def fetch_lrc_timestamps(song: str, artist: str) -> Optional[List[Dict]]:
-    try:
-        url = "https://lrclib.net/api/get"
-        loop = asyncio.get_event_loop()
-        resp = await loop.run_in_executor(
-            None, 
-            lambda: requests.get(url, params={"track_name": song, "artist_name": artist}, timeout=5)
-        )
-        data = resp.json()
-        lrc_text = data.get("syncedLyrics")
-        if not lrc_text: 
-            return None
-        
-        lines = []
-        for line in lrc_text.split('\n'):
-            if not line.strip(): 
-                continue
-            match = re.match(r'(\[\d+:\d+\.\d+\])\s*(.*)', line)
-            if match:
-                lines.append({'timestamp': match.group(1), 'reference': match.group(2).strip()})
-        return lines
-    except: 
-        return None
+# --- ENDPOINTS ---
+@app.get("/")
+async def root():
+    return {
+        "status": "Online",
+        "version": "Perfect Alignment v1",
+        "note": "今 is ALWAYS 'ima' (never 'genzai'), を is 'wo' (not 'o')",
+        "endpoints": {
+            "/get_song": "Get lyrics with perfect alignment",
+            "/get_song_fresh": "Get lyrics (fresh, no cache)",
+            "/clear_cache": "Clear all cache",
+            "/test_alignment": "Test alignment corrections"
+        }
+    }
 
-async def fetch_genius_lyrics(song: str, artist: str) -> Optional[Tuple[str, str]]:
-    if not GENIUS_API_TOKEN: 
-        return None
-    try:
-        headers = {"Authorization": f"Bearer {GENIUS_API_TOKEN}"}
-        loop = asyncio.get_event_loop()
-        
-        resp = await loop.run_in_executor(
-            None, 
-            lambda: requests.get("https://api.genius.com/search", headers=headers, params={"q": f"{song} {artist}"}, timeout=8)
-        )
-        data = resp.json()
-        
-        if not data['response']['hits']:
-            return None
-        
-        song_url = data['response']['hits'][0]['result']['url']
-        
-        page = await loop.run_in_executor(
-            None,
-            lambda: requests.get(song_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=8)
-        )
-        soup = BeautifulSoup(page.text, 'html.parser')
-        
-        lyrics_divs = soup.find_all('div', {'data-lyrics-container': 'true'})
-        full_text = []
-        for div in lyrics_divs:
-            text = div.get_text(separator='\n', strip=True)
-            full_text.append(text)
-        
-        romaji_text = '\n\n'.join(full_text)
-        romaji_text = re.sub(r'\[.*?\]', '', romaji_text)
-        romaji_text = re.sub(r'\n\s*\n', '\n', romaji_text)
-        romaji_text = romaji_text.strip()
-        
-        if romaji_text and len(romaji_text) > 30:
-            return romaji_text, song_url
-        return None
-        
-    except Exception as e:
-        print(f"Genius error: {e}")
-        return None
-
-# --- UPDATE ENDPOINTS ---
-@app.get("/get_song_perfect")
-async def get_song_perfect(song: str, artist: str, force_refresh: bool = False):
-    """Perfect alignment endpoint"""
+@app.get("/get_song")
+async def get_song_endpoint(song: str, artist: str, force_refresh: bool = False):
+    """Main endpoint - uses perfect alignment"""
     return await process_song_perfect(song, artist, force_refresh)
+
+@app.get("/get_song_fresh")
+async def get_song_fresh(song: str, artist: str):
+    """Always get fresh lyrics (no cache)"""
+    return await process_song_perfect(song, artist, force_refresh=True)
 
 @app.get("/test_alignment")
 async def test_alignment():
@@ -647,20 +668,62 @@ async def test_alignment():
         "success_rate": f"{sum(1 for r in results if r['match'])}/{len(results)}"
     }
 
-# Keep other endpoints as they are, but update /get_song to use perfect alignment
-@app.get("/get_song")
-async def get_song_endpoint(song: str, artist: str, force_refresh: bool = False):
-    """Main endpoint - uses perfect alignment"""
-    return await process_song_perfect(song, artist, force_refresh)
+@app.get("/convert")
+async def convert_single_line(text: str = ""):
+    if not text:
+        raise HTTPException(400, "No text")
+    
+    if not client:
+        return {"original": text, "romaji": text}
+    
+    try:
+        prompt = f"""Translate to Romaji. CRITICAL: 今 → "ima" (never "genzai"), を → "wo" (not "o").
+        
+        Japanese: {text}
+        Romaji:"""
+        
+        completion = await client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model=DEEPSEEK_MODEL,
+            temperature=0.0,
+            max_tokens=100
+        )
+        romaji = completion.choices[0].message.content.strip()
+        
+        # Double-check
+        if "今" in text and "genzai" in romaji.lower():
+            romaji = re.sub(r'\bgenzai\b', 'ima', romaji, flags=re.IGNORECASE)
+        
+        return {"original": text, "romaji": romaji}
+    except:
+        return {"original": text, "romaji": text}
 
-# Clear cache endpoint
 @app.delete("/clear_cache")
 async def clear_cache():
+    """Clear ALL cache"""
     song_cache.clear()
     line_cache.clear()
     if redis_client:
         redis_client.flushdb()
-    return {"status": "Cache cleared", "message": "Use /get_song_perfect for perfect alignment"}
+        print("🗑️ Redis cache cleared")
+    
+    print("🗑️ Memory cache cleared")
+    return {
+        "status": "Cache cleared",
+        "message": "All cached lyrics have been deleted. New requests will use perfect alignment.",
+        "important": "This fixes alignment issues like 'genzai' vs 'ima' and 'wo' vs 'o'"
+    }
+
+@app.get("/health")
+async def health():
+    """Health check endpoint"""
+    return {
+        "deepseek": bool(client),
+        "redis": redis_client.ping() if redis_client else False,
+        "genius": bool(GENIUS_API_TOKEN),
+        "cache_size": len(song_cache),
+        "version": "perfect_alignment_v1"
+    }
 
 if __name__ == "__main__":
     import uvicorn
