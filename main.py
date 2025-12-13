@@ -1,16 +1,14 @@
 """
-ULTIMATE ROMAJI ENGINE (v28.0-PHONETIC-GUARD)
-"The Logic Edition"
+ULTIMATE ROMAJI ENGINE (v30.0-HYPER-GLUE)
+"The Multi-Part Fixer"
 
 Fixes:
-- PHONETIC GUARD: Validates DB results against MeCab's official reading.
-  (Prevents 'Ima' becoming 'Genzai' or 'Watashi' becoming 'Jibun').
-- GLUE LOGIC: Fixes 'Sho'+'Heya' -> 'Kobeya'.
-- LYRIC SEARCH: Finds official lyrics.
-- RAM SAFE: Uses SQLite.
+- 3-LEVEL GLUE: Stitches words split into 3 parts (e.g. Ko+Be+Ya).
+- USER-AGENT: Prevents Lyric Search from getting blocked.
+- DEBUG TRACE: Tells you exactly which method was used for each line.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from openai import AsyncOpenAI
 import os
@@ -30,12 +28,19 @@ import sqlite3
 import gc
 from bs4 import BeautifulSoup
 from difflib import SequenceMatcher
+from contextlib import asynccontextmanager
 
-# ===== LOGGING & SETUP =====
+# ===== LOGGING =====
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
-logger = logging.getLogger("RomajiPhonetic")
+logger = logging.getLogger("RomajiHyperGlue")
 
-app = FastAPI(title="Romaji Phonetic Guard", version="28.0.0")
+# ===== LIFECYCLE =====
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    asyncio.create_task(background_builder())
+    yield
+
+app = FastAPI(title="Romaji Hyper-Glue", version="30.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware, 
     allow_origins=["*"], 
@@ -44,13 +49,13 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
-# ===== CONFIGURATION =====
+# ===== CONFIG =====
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 REDIS_URL = os.environ.get("REDIS_URL")
 ADMIN_SECRET = "admin123"
 DB_FILE = "titan_universe.db"
-DB_VERSION_MARKER = "v28_phonetic"
+DB_VERSION_MARKER = "v30_glue"
 
 MODELS = {
     "deepseek": {
@@ -67,8 +72,7 @@ MODELS = {
     }
 }
 
-# ===== PRIORITY 1: ABSOLUTE OVERRIDES =====
-# These skip ALL checks. Use sparingly.
+# ===== MANUAL OVERRIDES =====
 LYRIC_PACK = {
     "運命": "unmei", "奇跡": "kiseki", "約束": "yakusoku", "記憶": "kioku",
     "物語": "monogatari", "伝説": "densetsu", "永遠": "eien", "瞬間": "shunkan",
@@ -85,10 +89,8 @@ LYRIC_PACK = {
     "私": "watashi", "僕": "boku", "俺": "ore", "君": "kimi", "貴方": "anata",
     "明日": "ashita", "今日": "kyō", "昨日": "kinō", "世界": "sekai",
     "言葉": "kotoba", "心": "kokoro", "愛": "ai", "涙": "namida",
-    "笑顔": "egao", "瞳": "hitomi", "歌": "uta",
-    # Fixes
-    "煙草": "tabako", "たばこ": "tabako", "小部屋": "kobeya",
-    "今": "ima" # Force Ima
+    "笑顔": "egao", "瞳": "hitomi", "煙草": "tabako", "歌": "uta", 
+    "小部屋": "kobeya", "今": "ima"
 }
 
 # ===== BUILDER =====
@@ -103,48 +105,86 @@ def init_db():
     conn.commit()
     return conn
 
-def populate_from_url(url, label, converter, conn):
+async def download_and_parse_stream(url, label, converter, conn):
     try:
-        logger.info(f"⬇️ Downloading {label}...")
-        resp = requests.get(url, timeout=120) 
-        if resp.status_code == 200:
-            logger.info(f"📦 Parsing {label}...")
-            content = gzip.decompress(resp.content).decode("euc-jp", errors="ignore")
-            c = conn.cursor()
-            batch = []
-            for line in content.splitlines():
+        temp_file = f"temp_{label}.gz"
+        logger.info(f"⬇️ {label}: Downloading...")
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    with open(temp_file, 'wb') as f:
+                        while True:
+                            chunk = await resp.content.read(1024*1024)
+                            if not chunk: break
+                            f.write(chunk)
+                else: return
+
+        logger.info(f"📦 {label}: Parsing...")
+        c = conn.cursor()
+        batch = []
+        
+        with gzip.open(temp_file, 'rt', encoding='euc-jp', errors='ignore') as f:
+            for line in f:
                 try:
-                    parts = line.split(" /")
-                    header = parts[0]
-                    word, reading = "", ""
-                    if "[" in header:
-                        match = re.match(r"(.+?)\s+\[(.+?)\]", header)
-                        if match: word, reading = match.group(1), match.group(2)
+                    if " [" in line:
+                        parts = line.split(" [", 1)
+                        word, rest = parts[0], parts[1]
+                        reading = rest.split("]", 1)[0] if "]" in rest else word
                     else:
-                        word, reading = header.split()[0], header.split()[0]
-                    
+                        word = line.split(" /", 1)[0]
+                        reading = word
+
                     if word and reading:
                         if len(word) == 1 and ('\u3040' <= word <= '\u309f'): continue 
                         if any(x in word for x in "▽▼().,"): continue
                         
                         romaji = converter.do(reading).strip()
-                        raw_words = word.split(";")
-                        for w in raw_words:
-                            clean_word = re.sub(r"\(.*?\)", "", w).strip()
-                            if clean_word: batch.append((clean_word, romaji))
+                        if ";" in word:
+                            for w in word.split(";"):
+                                clean = w.split("(")[0].strip()
+                                if clean: batch.append((clean, romaji))
+                        else:
+                            batch.append((word, romaji))
                         
-                        if len(batch) >= 10000:
+                        if len(batch) >= 20000:
                             c.executemany('INSERT OR IGNORE INTO dictionary VALUES (?,?)', batch)
                             conn.commit()
                             batch = []
+                            await asyncio.sleep(0.01)
                 except: continue
-            if batch:
-                c.executemany('INSERT OR IGNORE INTO dictionary VALUES (?,?)', batch)
-                conn.commit()
-            del content
-            gc.collect()
-            logger.info(f"✅ {label} Done.")
-    except Exception as e: logger.error(f"⚠️ {label} Failed: {e}")
+        
+        if batch:
+            c.executemany('INSERT OR IGNORE INTO dictionary VALUES (?,?)', batch)
+            conn.commit()
+        
+        if os.path.exists(temp_file): os.remove(temp_file)
+        logger.info(f"✅ {label}: Done.")
+        
+    except Exception as e:
+        logger.error(f"⚠️ {label} Error: {e}")
+
+async def background_builder():
+    if check_db_status() > 50000: return
+    logger.info("🚀 BUILDER STARTED")
+    import pykakasi
+    k = pykakasi.kakasi()
+    k.setMode("H", "a")
+    k.setMode("K", "a")
+    k.setMode("J", "a")
+    k.setMode("r", "Hepburn")
+    conv = k.getConverter()
+    
+    if os.path.exists(DB_FILE): os.remove(DB_FILE)
+    conn = init_db()
+    
+    await download_and_parse_stream(EDICT_URL, "EDICT", conv, conn)
+    await download_and_parse_stream(ENAMDICT_URL, "ENAMDICT", conv, conn)
+    
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO meta VALUES ('version', ?)", (DB_VERSION_MARKER,))
+    conn.commit()
+    conn.close()
+    logger.info("🎉 BUILD COMPLETE")
 
 def check_db_status():
     if not os.path.exists(DB_FILE): return 0
@@ -157,27 +197,6 @@ def check_db_status():
             c.execute('SELECT count(*) FROM dictionary')
             return c.fetchone()[0]
     except: return 0
-
-def build_universe_sql():
-    status = check_db_status()
-    if status > 50000: return 
-    if status == -1 and os.path.exists(DB_FILE): os.remove(DB_FILE)
-    logger.info("🌌 STARTING UNIVERSE BUILD...")
-    import pykakasi
-    k = pykakasi.kakasi()
-    k.setMode("H", "a")
-    k.setMode("K", "a")
-    k.setMode("J", "a")
-    k.setMode("r", "Hepburn")
-    conv = k.getConverter()
-    conn = init_db()
-    populate_from_url(EDICT_URL, "EDICT", conv, conn)
-    populate_from_url(ENAMDICT_URL, "ENAMDICT", conv, conn)
-    c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO meta VALUES ('version', ?)", (DB_VERSION_MARKER,))
-    conn.commit()
-    conn.close()
-    logger.info("✅ DB READY")
 
 def get_static_romaji(word):
     if len(word) < 2: return None 
@@ -197,7 +216,6 @@ l1_cache = {}
 
 def init_globals():
     global tagger, kakasi_conv, redis_client, MODELS
-    build_universe_sql()
     try:
         import fugashi
         import unidic_lite
@@ -222,7 +240,7 @@ def init_globals():
 
 init_globals()
 
-# ===== SEARCH =====
+# ===== LYRIC SEARCH =====
 class LyricSearchEngine:
     BASE_URL = "http://search.j-lyric.net/index.php"
     @staticmethod
@@ -230,15 +248,17 @@ class LyricSearchEngine:
         clean_q = re.sub(r"[!?.、。]", " ", user_text).strip()
         if len(clean_q) < 4: return None
         params = {"kt": clean_q, "ct": 2, "ka": "", "ca": 2, "kl": "", "cl": 2}
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
         try:
-            async with session.get(LyricSearchEngine.BASE_URL, params=params, timeout=3.0) as resp:
+            async with session.get(LyricSearchEngine.BASE_URL, params=params, headers=headers, timeout=4.0) as resp:
                 if resp.status != 200: return None
                 soup = BeautifulSoup(await resp.text(), 'html.parser')
                 body = soup.find('div', id='mnb')
                 if not body: return None
                 link = body.find('p', class_='mid').find('a')
                 if not link: return None
-                async with session.get(link['href'], timeout=3.0) as song_resp:
+                
+                async with session.get(link['href'], headers=headers, timeout=4.0) as song_resp:
                     song_soup = BeautifulSoup(await song_resp.text(), 'html.parser')
                     lyric_div = song_soup.find('p', id='Lyric')
                     if lyric_div:
@@ -248,40 +268,49 @@ class LyricSearchEngine:
         except: return None
         return None
 
-# ===== CONVERSION LOGIC (PHONETIC GUARD) =====
-
 def is_phonetically_similar(a, b):
-    """Returns True if 'genzai' vs 'ima' are distinct (False)"""
     if not a or not b: return False
     return SequenceMatcher(None, a, b).ratio() > 0.3
+
+# ===== CONVERSION (HYPER GLUE) =====
 
 def local_convert(text: str) -> Tuple[str, List[str]]:
     if not tagger or not kakasi_conv: return text, []
     romaji_parts = []
     research_targets = []
-    
     text = text.replace("　", " ")
     nodes = list(tagger(text))
-    
     i = 0
+    
     while i < len(nodes):
         node = nodes[i]
         word = node.surface
         
-        # 1. GLUE LOGIC
-        if i + 1 < len(nodes):
-            next_node = nodes[i+1]
-            combined = word + next_node.surface
-            if combined in LYRIC_PACK:
-                romaji_parts.append(LYRIC_PACK[combined])
-                i += 2; continue
-            db_hit = get_static_romaji(combined)
+        # --- 3-LEVEL GLUE LOGIC ---
+        # Try gluing 3 parts: A + B + C (e.g., Ko+Be+Ya)
+        if i + 2 < len(nodes):
+            tri_combo = word + nodes[i+1].surface + nodes[i+2].surface
+            if tri_combo in LYRIC_PACK:
+                romaji_parts.append(LYRIC_PACK[tri_combo])
+                i += 3; continue
+            db_hit = get_static_romaji(tri_combo)
             if db_hit:
-                # Check Glue Validity
+                romaji_parts.append(db_hit)
+                i += 3; continue
+
+        # Try gluing 2 parts: A + B (e.g. En+Sou)
+        if i + 1 < len(nodes):
+            duo_combo = word + nodes[i+1].surface
+            if duo_combo in LYRIC_PACK:
+                romaji_parts.append(LYRIC_PACK[duo_combo])
+                i += 2; continue
+            db_hit = get_static_romaji(duo_combo)
+            if db_hit:
                 romaji_parts.append(db_hit)
                 i += 2; continue
+        # --------------------------
 
-        # 2. PARTICLE PRIORITY
+        # Particles
         if node.feature[0] == '助詞':
             if word == 'は': romaji_parts.append('wa')
             elif word == 'へ': romaji_parts.append('e')
@@ -289,34 +318,27 @@ def local_convert(text: str) -> Tuple[str, List[str]]:
             else: romaji_parts.append(kakasi_conv.do(word))
             i += 1; continue
             
-        # 3. LYRIC PACK PRIORITY
+        # Lyric Pack
         if word in LYRIC_PACK:
             romaji_parts.append(LYRIC_PACK[word])
             i += 1; continue
 
-        # 4. DATABASE WITH PHONETIC GUARD
+        # DB Check
         db_romaji = get_static_romaji(word)
-        
-        # Get standard MeCab reading
-        mecab_reading_raw = node.feature[7] if len(node.feature) > 7 and node.feature[7] != '*' else word
-        mecab_romaji = kakasi_conv.do(mecab_reading_raw).strip()
+        mecab_raw = node.feature[7] if len(node.feature) > 7 and node.feature[7] != '*' else word
+        mecab_romaji = kakasi_conv.do(mecab_raw).strip()
         
         if db_romaji:
-            # GUARD: If DB result is TOTALLY different from MeCab, assume DB is showing "Meaning" not "Reading"
-            # Example: Word="今" -> MeCab="ima" -> DB="genzai". Mismatch! -> Use MeCab.
-            if len(word) == 1: # Strict check for single Kanji
+            if len(word) == 1:
                 if not is_phonetically_similar(db_romaji, mecab_romaji):
-                    # Trust MeCab for single kanji if DB is wild
-                    romaji_parts.append(mecab_romaji)
+                    romaji_parts.append(mecab_romaji) 
                 else:
                     romaji_parts.append(db_romaji)
             else:
-                # Trust DB for compounds
                 romaji_parts.append(db_romaji)
         else:
             romaji_parts.append(mecab_romaji)
 
-        # 5. RESEARCH TARGET
         if any('\u4e00' <= c <= '\u9fff' for c in word):
             research_targets.append(word)
         i += 1
@@ -333,9 +355,9 @@ async def call_ai(client, model_id, prompt):
         return json.loads(resp.choices[0].message.content)
     except: return None
 
-async def process_text_phonetic(text: str) -> Dict:
+async def process_text_glue(text: str) -> Dict:
     start = time.perf_counter()
-    cache_key = f"phonetic:{hashlib.md5(text.encode()).hexdigest()}"
+    cache_key = f"glue_v30:{hashlib.md5(text.encode()).hexdigest()}"
     
     if cache_key in l1_cache: return l1_cache[cache_key]
     if redis_client:
@@ -358,7 +380,7 @@ async def process_text_phonetic(text: str) -> Dict:
     
     # 2. AI REFINEMENT
     if (research_needs and not official_match) and MODELS["deepseek"]["client"]:
-        prompt = f"Task: Fix Romaji.\nJP: {text}\nDraft: {draft}\nAttention: {', '.join(research_needs)}\nRules: wa/wo/e particles, 'ima' not 'genzai'.\nJSON: {{'corrected': 'string'}}"
+        prompt = f"Task: Fix Romaji.\nJP: {text}\nDraft: {draft}\nAttention: {', '.join(research_needs)}\nRules: wa/wo/e particles.\nJSON: {{'corrected': 'string'}}"
         data = await call_ai(MODELS["deepseek"]["client"], MODELS["deepseek"]["id"], prompt)
         if data:
             final_romaji = data.get("corrected", draft)
@@ -368,7 +390,7 @@ async def process_text_phonetic(text: str) -> Dict:
         "original": text,
         "romaji": re.sub(r'\s+', ' ', final_romaji).strip(),
         "method": method,
-        "official_match": official_match,
+        "trace": f"Official:{official_match}, DB_Size:{check_db_status()}",
         "time": round(time.perf_counter()-start, 4)
     }
     
@@ -379,18 +401,18 @@ async def process_text_phonetic(text: str) -> Dict:
 @app.get("/convert")
 async def convert(text: str):
     if not text: raise HTTPException(400)
-    return await process_text_phonetic(text)
+    return await process_text_glue(text)
 
 @app.post("/convert-batch")
 async def convert_batch(lines: List[str]):
-    return await asyncio.gather(*[process_text_phonetic(l) for l in lines])
+    return await asyncio.gather(*[process_text_glue(l) for l in lines])
 
 @app.post("/force-rebuild")
 async def force_rebuild(secret: str):
     if secret != ADMIN_SECRET: raise HTTPException(403)
     if os.path.exists(DB_FILE): os.remove(DB_FILE)
-    build_universe_sql()
-    return {"status": "REBUILT", "words": check_db_status()}
+    asyncio.create_task(background_builder())
+    return {"status": "Background Rebuild Started"}
 
 @app.post("/clear-cache")
 async def clear_cache(secret: str):
@@ -402,7 +424,7 @@ async def clear_cache(secret: str):
 
 @app.get("/")
 def root():
-    return {"status": "PHONETIC_GUARD_ONLINE", "db_size": check_db_status()}
+    return {"status": "HYPER_GLUE_ONLINE", "db_size": check_db_status()}
 
 if __name__ == "__main__":
     import uvicorn
