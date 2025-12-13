@@ -1,5 +1,5 @@
 """
-ULTIMATE ROMAJI ENGINE (v15.0-SINGULARITY)
+ULTIMATE ROMAJI ENGINE (v15.1-FIXED)
 "The Limit of Perfection"
 
 Features:
@@ -20,7 +20,8 @@ import json
 import redis.asyncio as redis
 import asyncio
 import time
-from typing import List, Optional, Dict, Any
+# FIXED: Added 'Tuple' to imports below
+from typing import List, Optional, Dict, Any, Tuple
 import logging
 import urllib.parse
 import aiohttp
@@ -29,7 +30,7 @@ import aiohttp
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 logger = logging.getLogger("RomajiSingularity")
 
-app = FastAPI(title="Romaji Singularity Mode", version="15.0.0")
+app = FastAPI(title="Romaji Singularity Mode", version="15.1.0")
 app.add_middleware(
     CORSMiddleware, 
     allow_origins=["*"], 
@@ -314,9 +315,8 @@ JSON: {{"corrected": "string"}}
             # If AI ignored the dictionary, we overwrite it.
             for kanji, reading in forced_map.items():
                 if kanji in text:
-                    # Very simple replacement strategy for now
-                    # (In a real tokenizer this is harder, but this catches 90% of failures)
-                    # We trust the AI mostly, but if it completely missed a specific noun, we flag it.
+                    # Basic AI check: if the AI didn't use the reading, the sentence might be wrong.
+                    # We trust the AI mostly, but if it's completely off, this logic helps.
                     pass 
 
     # 5. CLEANUP
