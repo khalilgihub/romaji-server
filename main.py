@@ -1,13 +1,13 @@
 """
-ULTIMATE ROMAJI ENGINE (v27.0-HYPER-SCAN)
-"The Compound Word Fixer"
+ULTIMATE ROMAJI ENGINE (v28.0-PHONETIC-GUARD)
+"The Logic Edition"
 
 Fixes:
-- GLUE LOGIC: Detects when MeCab wrongly splits words (e.g. 'Sho'+'Heya') 
-  and glues them back together ('Kobeya') using the DB.
-- LYRIC SEARCH: Finds official lyrics to fix typos.
-- UNIVERSE DB: 880,000+ words.
-- ACCURACY: Fixes "Ensou" -> "Tabako" and "Shoheya" -> "Kobeya".
+- PHONETIC GUARD: Validates DB results against MeCab's official reading.
+  (Prevents 'Ima' becoming 'Genzai' or 'Watashi' becoming 'Jibun').
+- GLUE LOGIC: Fixes 'Sho'+'Heya' -> 'Kobeya'.
+- LYRIC SEARCH: Finds official lyrics.
+- RAM SAFE: Uses SQLite.
 """
 
 from fastapi import FastAPI, HTTPException
@@ -33,9 +33,9 @@ from difflib import SequenceMatcher
 
 # ===== LOGGING & SETUP =====
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
-logger = logging.getLogger("RomajiHyperScan")
+logger = logging.getLogger("RomajiPhonetic")
 
-app = FastAPI(title="Romaji Hyper-Scan", version="27.0.0")
+app = FastAPI(title="Romaji Phonetic Guard", version="28.0.0")
 app.add_middleware(
     CORSMiddleware, 
     allow_origins=["*"], 
@@ -50,7 +50,7 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 REDIS_URL = os.environ.get("REDIS_URL")
 ADMIN_SECRET = "admin123"
 DB_FILE = "titan_universe.db"
-DB_VERSION_MARKER = "v27_scan"
+DB_VERSION_MARKER = "v28_phonetic"
 
 MODELS = {
     "deepseek": {
@@ -67,7 +67,8 @@ MODELS = {
     }
 }
 
-# ===== PRIORITY 1: LYRIC PACK =====
+# ===== PRIORITY 1: ABSOLUTE OVERRIDES =====
+# These skip ALL checks. Use sparingly.
 LYRIC_PACK = {
     "運命": "unmei", "奇跡": "kiseki", "約束": "yakusoku", "記憶": "kioku",
     "物語": "monogatari", "伝説": "densetsu", "永遠": "eien", "瞬間": "shunkan",
@@ -79,17 +80,18 @@ LYRIC_PACK = {
     "咆哮": "hōkō", "残響": "zankyō", "絶望": "zetsubō", "希望": "kibō",
     "絆": "kizuna", "証": "akashi", "翼": "tsubasa", "扉": "tobira",
     "鍵": "kagi", "鎖": "kusari", "炎": "honō", "氷": "kōri",
-    "光": "hikari", "闇": "yami", "影": "kage", "海": "umi", "星": "hoshi",
-    "夢": "yume", "私": "watashi", "僕": "boku", "俺": "ore", "君": "kimi", 
-    "貴方": "anata", "明日": "ashita", "今日": "kyō", "昨日": "kinō", 
-    "世界": "sekai", "言葉": "kotoba", "心": "kokoro", "愛": "ai", 
-    "涙": "namida", "笑顔": "egao", "瞳": "hitomi",
-    # Specific User Fixes
-    "煙草": "tabako", "たばこ": "tabako", "タバコ": "tabako",
-    "小部屋": "kobeya", "歌": "uta"
+    "光": "hikari", "闇": "yami", "影": "kage", "空": "sora",
+    "海": "umi", "星": "hoshi", "月": "tsuki", "夢": "yume",
+    "私": "watashi", "僕": "boku", "俺": "ore", "君": "kimi", "貴方": "anata",
+    "明日": "ashita", "今日": "kyō", "昨日": "kinō", "世界": "sekai",
+    "言葉": "kotoba", "心": "kokoro", "愛": "ai", "涙": "namida",
+    "笑顔": "egao", "瞳": "hitomi", "歌": "uta",
+    # Fixes
+    "煙草": "tabako", "たばこ": "tabako", "小部屋": "kobeya",
+    "今": "ima" # Force Ima
 }
 
-# ===== DB BUILDER =====
+# ===== BUILDER =====
 EDICT_URL = "http://ftp.edrdg.org/pub/Nihongo/edict.gz"
 ENAMDICT_URL = "http://ftp.edrdg.org/pub/Nihongo/enamdict.gz"
 
@@ -157,8 +159,9 @@ def check_db_status():
     except: return 0
 
 def build_universe_sql():
-    if check_db_status() > 50000: return 
-    if os.path.exists(DB_FILE): os.remove(DB_FILE)
+    status = check_db_status()
+    if status > 50000: return 
+    if status == -1 and os.path.exists(DB_FILE): os.remove(DB_FILE)
     logger.info("🌌 STARTING UNIVERSE BUILD...")
     import pykakasi
     k = pykakasi.kakasi()
@@ -219,7 +222,7 @@ def init_globals():
 
 init_globals()
 
-# ===== SEARCH ENGINE =====
+# ===== SEARCH =====
 class LyricSearchEngine:
     BASE_URL = "http://search.j-lyric.net/index.php"
     @staticmethod
@@ -235,7 +238,6 @@ class LyricSearchEngine:
                 if not body: return None
                 link = body.find('p', class_='mid').find('a')
                 if not link: return None
-                
                 async with session.get(link['href'], timeout=3.0) as song_resp:
                     song_soup = BeautifulSoup(await song_resp.text(), 'html.parser')
                     lyric_div = song_soup.find('p', id='Lyric')
@@ -246,14 +248,18 @@ class LyricSearchEngine:
         except: return None
         return None
 
-# ===== CONVERSION LOGIC (GLUE FIX) =====
+# ===== CONVERSION LOGIC (PHONETIC GUARD) =====
+
+def is_phonetically_similar(a, b):
+    """Returns True if 'genzai' vs 'ima' are distinct (False)"""
+    if not a or not b: return False
+    return SequenceMatcher(None, a, b).ratio() > 0.3
 
 def local_convert(text: str) -> Tuple[str, List[str]]:
     if not tagger or not kakasi_conv: return text, []
     romaji_parts = []
     research_targets = []
     
-    # Pre-clean
     text = text.replace("　", " ")
     nodes = list(tagger(text))
     
@@ -262,51 +268,55 @@ def local_convert(text: str) -> Tuple[str, List[str]]:
         node = nodes[i]
         word = node.surface
         
-        # --- GLUE LOGIC START ---
-        # Check if current node + next node forms a valid word in DB
-        # This fixes 'Sho'+'Heya' -> 'Kobeya' and 'En'+'Sou' -> 'Tabako'
+        # 1. GLUE LOGIC
         if i + 1 < len(nodes):
             next_node = nodes[i+1]
             combined = word + next_node.surface
-            
-            # 1. Check Lyric Pack for Combo
             if combined in LYRIC_PACK:
                 romaji_parts.append(LYRIC_PACK[combined])
-                i += 2 # Skip next node
-                continue
-                
-            # 2. Check DB for Combo
+                i += 2; continue
             db_hit = get_static_romaji(combined)
             if db_hit:
+                # Check Glue Validity
                 romaji_parts.append(db_hit)
-                i += 2 # Skip next node
-                continue
-        # --- GLUE LOGIC END ---
+                i += 2; continue
 
-        # Standard Processing
+        # 2. PARTICLE PRIORITY
         if node.feature[0] == '助詞':
             if word == 'は': romaji_parts.append('wa')
             elif word == 'へ': romaji_parts.append('e')
             elif word == 'を': romaji_parts.append('wo')
             else: romaji_parts.append(kakasi_conv.do(word))
-            i += 1
-            continue
+            i += 1; continue
             
+        # 3. LYRIC PACK PRIORITY
         if word in LYRIC_PACK:
             romaji_parts.append(LYRIC_PACK[word])
-            i += 1
-            continue
+            i += 1; continue
 
-        db_hit = get_static_romaji(word)
-        if db_hit:
-            romaji_parts.append(db_hit)
-            i += 1
-            continue
-            
-        reading = node.feature[7] if len(node.feature) > 7 and node.feature[7] != '*' else None
-        roma = kakasi_conv.do(reading) if reading else kakasi_conv.do(word)
-        romaji_parts.append(roma)
+        # 4. DATABASE WITH PHONETIC GUARD
+        db_romaji = get_static_romaji(word)
+        
+        # Get standard MeCab reading
+        mecab_reading_raw = node.feature[7] if len(node.feature) > 7 and node.feature[7] != '*' else word
+        mecab_romaji = kakasi_conv.do(mecab_reading_raw).strip()
+        
+        if db_romaji:
+            # GUARD: If DB result is TOTALLY different from MeCab, assume DB is showing "Meaning" not "Reading"
+            # Example: Word="今" -> MeCab="ima" -> DB="genzai". Mismatch! -> Use MeCab.
+            if len(word) == 1: # Strict check for single Kanji
+                if not is_phonetically_similar(db_romaji, mecab_romaji):
+                    # Trust MeCab for single kanji if DB is wild
+                    romaji_parts.append(mecab_romaji)
+                else:
+                    romaji_parts.append(db_romaji)
+            else:
+                # Trust DB for compounds
+                romaji_parts.append(db_romaji)
+        else:
+            romaji_parts.append(mecab_romaji)
 
+        # 5. RESEARCH TARGET
         if any('\u4e00' <= c <= '\u9fff' for c in word):
             research_targets.append(word)
         i += 1
@@ -323,9 +333,9 @@ async def call_ai(client, model_id, prompt):
         return json.loads(resp.choices[0].message.content)
     except: return None
 
-async def process_text_scan(text: str) -> Dict:
+async def process_text_phonetic(text: str) -> Dict:
     start = time.perf_counter()
-    cache_key = f"scan:{hashlib.md5(text.encode()).hexdigest()}"
+    cache_key = f"phonetic:{hashlib.md5(text.encode()).hexdigest()}"
     
     if cache_key in l1_cache: return l1_cache[cache_key]
     if redis_client:
@@ -337,7 +347,7 @@ async def process_text_scan(text: str) -> Dict:
     method = "local_db"
     official_match = False
     
-    # 1. J-LYRIC SEARCH
+    # 1. LYRIC SEARCH
     async with aiohttp.ClientSession() as session:
         official = await LyricSearchEngine.find_official_line(session, text)
         if official:
@@ -348,7 +358,7 @@ async def process_text_scan(text: str) -> Dict:
     
     # 2. AI REFINEMENT
     if (research_needs and not official_match) and MODELS["deepseek"]["client"]:
-        prompt = f"Task: Fix Romaji.\nJP: {text}\nDraft: {draft}\nAttention: {', '.join(research_needs)}\nRules: wa/wo/e particles.\nJSON: {{'corrected': 'string'}}"
+        prompt = f"Task: Fix Romaji.\nJP: {text}\nDraft: {draft}\nAttention: {', '.join(research_needs)}\nRules: wa/wo/e particles, 'ima' not 'genzai'.\nJSON: {{'corrected': 'string'}}"
         data = await call_ai(MODELS["deepseek"]["client"], MODELS["deepseek"]["id"], prompt)
         if data:
             final_romaji = data.get("corrected", draft)
@@ -369,11 +379,11 @@ async def process_text_scan(text: str) -> Dict:
 @app.get("/convert")
 async def convert(text: str):
     if not text: raise HTTPException(400)
-    return await process_text_scan(text)
+    return await process_text_phonetic(text)
 
 @app.post("/convert-batch")
 async def convert_batch(lines: List[str]):
-    return await asyncio.gather(*[process_text_scan(l) for l in lines])
+    return await asyncio.gather(*[process_text_phonetic(l) for l in lines])
 
 @app.post("/force-rebuild")
 async def force_rebuild(secret: str):
@@ -392,7 +402,7 @@ async def clear_cache(secret: str):
 
 @app.get("/")
 def root():
-    return {"status": "HYPER_SCAN_ONLINE", "db_size": check_db_status()}
+    return {"status": "PHONETIC_GUARD_ONLINE", "db_size": check_db_status()}
 
 if __name__ == "__main__":
     import uvicorn
