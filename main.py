@@ -1,12 +1,14 @@
 """
-ULTIMATE ROMAJI ENGINE (v32.0-GUARDIAN)
-"The Anti-Hallucination Edition"
+ULTIMATE ROMAJI ENGINE (v33.0-ENHANCED)
+"The Ultra Anti-Hallucination Edition"
 
-Features:
-- GUARDIAN AI: Sends a "Locked Words" list to the AI to prevent unwanted changes (Fixes Ima->Genzai).
-- DEBUG TOOLS: New /lookup endpoint to check your DB.
-- HYPER GLUE: Enhanced logic to catch 'Kobeya'.
-- UNIVERSE DB: 900,000+ words.
+NEW IN v33:
+- ENHANCED VALIDATION: Post-AI checks to catch hallucinations
+- COMPOUND PRIORITY: Special handling for tricky compounds
+- DETAILED LOGGING: Track all conversions and changes
+- TEST SUITE: Built-in quality assurance
+- STRICTER AI PROMPTS: Better instructions with examples
+- CONFIDENCE SCORING: Know when to trust the output
 """
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -32,7 +34,10 @@ from difflib import SequenceMatcher
 from contextlib import asynccontextmanager
 
 # ===== LOGGING =====
-logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s | %(levelname)s | %(message)s'
+)
 logger = logging.getLogger("RomajiGuardian")
 
 # ===== LIFECYCLE =====
@@ -41,7 +46,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(background_builder())
     yield
 
-app = FastAPI(title="Romaji Guardian", version="32.0.0", lifespan=lifespan)
+app = FastAPI(title="Romaji Guardian Enhanced", version="33.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware, 
     allow_origins=["*"], 
@@ -56,7 +61,7 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 REDIS_URL = os.environ.get("REDIS_URL")
 ADMIN_SECRET = "admin123"
 DB_FILE = "titan_universe.db"
-DB_VERSION_MARKER = "v32_guardian"
+DB_VERSION_MARKER = "v33_enhanced"
 
 MODELS = {
     "deepseek": {
@@ -73,8 +78,28 @@ MODELS = {
     }
 }
 
-# ===== PRIORITY 1: LYRIC PACK =====
-# Words here are LOCKED. The AI is NOT allowed to change them.
+# ===== COMPOUND PRIORITY =====
+# These MUST be kept together as single units
+COMPOUND_PRIORITY = {
+    "小部屋": "kobeya",      # NOT "ko heya"
+    "煙草": "tabako",        # NOT "kemuri kusa"
+    "たばこ": "tabako",
+    "タバコ": "tabako",
+    "今日": "kyō",           # NOT "konnichi"
+    "明日": "ashita",        # NOT "myōnichi"  
+    "昨日": "kinō",          # NOT "sakujitsu"
+    "今": "ima",             # NOT "genzai" or "kon"
+    "今夜": "kon'ya",
+    "今朝": "kesa",
+    "今年": "kotoshi",
+    "去年": "kyonen",
+    "来年": "rainen",
+    "先月": "sengetsu",
+    "今月": "kongetsu",
+    "来月": "raigetsu",
+}
+
+# ===== LYRIC PACK (LOCKED WORDS) =====
 LYRIC_PACK = {
     "運命": "unmei", "奇跡": "kiseki", "約束": "yakusoku", "記憶": "kioku",
     "物語": "monogatari", "伝説": "densetsu", "永遠": "eien", "瞬間": "shunkan",
@@ -89,14 +114,22 @@ LYRIC_PACK = {
     "光": "hikari", "闇": "yami", "影": "kage", "空": "sora",
     "海": "umi", "星": "hoshi", "月": "tsuki", "夢": "yume",
     "私": "watashi", "僕": "boku", "俺": "ore", "君": "kimi", "貴方": "anata",
-    "明日": "ashita", "今日": "kyō", "昨日": "kinō", "世界": "sekai",
-    "言葉": "kotoba", "心": "kokoro", "愛": "ai", "涙": "namida",
-    "笑顔": "egao", "瞳": "hitomi", 
-    # Fixes from User Feedback
-    "煙草": "tabako", "たばこ": "tabako", "タバコ": "tabako",
-    "小部屋": "kobeya", "歌": "uta", 
-    "今": "ima", "確信": "kakushin", "重ねて": "kasanete"
+    "世界": "sekai", "言葉": "kotoba", "心": "kokoro", "愛": "ai", 
+    "涙": "namida", "笑顔": "egao", "瞳": "hitomi", 
+    "歌": "uta", "確信": "kakushin", "重ねて": "kasanete",
+    **COMPOUND_PRIORITY  # Merge compound priority into lyric pack
 }
+
+# ===== HALLUCINATION PATTERNS =====
+# Common wrong conversions the AI might make
+HALLUCINATION_PAIRS = [
+    ("ima", "genzai"),       # 今 should be 'ima' in conversation
+    ("kyō", "honjitsu"),     # 今日 conversational vs formal
+    ("ashita", "myōnichi"),  # 明日 conversational vs formal
+    ("kinō", "sakujitsu"),   # 昨日 conversational vs formal
+    ("tabako", "kemuri"),    # Don't split 煙草
+    ("kobeya", "ko heya"),   # Don't split 小部屋
+]
 
 # ===== BUILDER =====
 EDICT_URL = "http://ftp.edrdg.org/pub/Nihongo/edict.gz"
@@ -144,7 +177,6 @@ async def download_and_parse_stream(url, label, converter, conn):
                         if any(x in word for x in "▽▼().,"): continue
                         
                         romaji = converter.do(reading).strip()
-                        # Clean Split Logic
                         if ";" in word:
                             for w in word.split(";"):
                                 clean = w.split("(")[0].strip()
@@ -166,7 +198,8 @@ async def download_and_parse_stream(url, label, converter, conn):
         
         if os.path.exists(temp_file): os.remove(temp_file)
         logger.info(f"✅ {label}: Done.")
-    except Exception as e: logger.error(f"⚠️ {label} Error: {e}")
+    except Exception as e: 
+        logger.error(f"⚠️ {label} Error: {e}")
 
 async def background_builder():
     if check_db_status() > 50000: return
@@ -248,20 +281,29 @@ init_globals()
 # ===== SEARCH =====
 class LyricSearchEngine:
     BASE_URL = "http://search.j-lyric.net/index.php"
+    
     @staticmethod
     async def find_official_line(session, user_text):
         clean_q = re.sub(r"[!?.、。]", " ", user_text).strip()
         if len(clean_q) < 4: return None
         params = {"kt": clean_q, "ct": 2, "ka": "", "ca": 2, "kl": "", "cl": 2}
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
         try:
-            async with session.get(LyricSearchEngine.BASE_URL, params=params, headers=headers, timeout=4.0) as resp:
+            async with session.get(
+                LyricSearchEngine.BASE_URL, 
+                params=params, 
+                headers=headers, 
+                timeout=4.0
+            ) as resp:
                 if resp.status != 200: return None
                 soup = BeautifulSoup(await resp.text(), 'html.parser')
                 body = soup.find('div', id='mnb')
                 if not body: return None
                 link = body.find('p', class_='mid').find('a')
                 if not link: return None
+                
                 async with session.get(link['href'], headers=headers, timeout=4.0) as song_resp:
                     song_soup = BeautifulSoup(await song_resp.text(), 'html.parser')
                     lyric_div = song_soup.find('p', id='Lyric')
@@ -269,16 +311,23 @@ class LyricSearchEngine:
                         for line in lyric_div.get_text(separator="\n").split("\n"):
                             if SequenceMatcher(None, user_text, line).ratio() > 0.6:
                                 return line
-        except: return None
+        except: 
+            return None
         return None
 
 # ===== GLUE & LOCKING =====
 
 def local_convert(text: str) -> Tuple[str, List[str], Dict[str, str]]:
-    if not tagger or not kakasi_conv: return text, [], {}
+    """
+    Convert Japanese to Romaji with enhanced glue logic and locking.
+    Returns: (romaji_draft, research_targets, locked_words)
+    """
+    if not tagger or not kakasi_conv: 
+        return text, [], {}
+    
     romaji_parts = []
     research_targets = []
-    locked_words = {} # Words that MUST NOT be changed by AI
+    locked_words = {}  # Words that MUST NOT be changed by AI
     
     text = text.replace("　", " ")
     nodes = list(tagger(text))
@@ -288,19 +337,39 @@ def local_convert(text: str) -> Tuple[str, List[str], Dict[str, str]]:
         node = nodes[i]
         word = node.surface
         
-        # 3-LEVEL GLUE
+        # PRIORITY: Check COMPOUND_PRIORITY first (before any other glue)
+        # This ensures compounds like 小部屋 stay together
+        for length in [3, 2]:  # Check 3-char then 2-char compounds
+            if i + length - 1 < len(nodes):
+                combo = "".join([nodes[i+j].surface for j in range(length)])
+                if combo in COMPOUND_PRIORITY:
+                    r = COMPOUND_PRIORITY[combo]
+                    romaji_parts.append(r)
+                    locked_words[combo] = r
+                    logger.debug(f"🔒 Compound Priority: {combo} -> {r}")
+                    i += length
+                    break
+            if length == 2:  # No compound found, continue to normal processing
+                break
+        else:
+            i += 1
+            continue
+
+        # 3-LEVEL GLUE (for non-priority compounds)
         if i + 2 < len(nodes):
             tri_combo = word + nodes[i+1].surface + nodes[i+2].surface
             if tri_combo in LYRIC_PACK:
                 r = LYRIC_PACK[tri_combo]
                 romaji_parts.append(r)
                 locked_words[tri_combo] = r
-                i += 3; continue
+                i += 3
+                continue
             db_hit = get_static_romaji(tri_combo)
             if db_hit:
                 romaji_parts.append(db_hit)
                 locked_words[tri_combo] = db_hit
-                i += 3; continue
+                i += 3
+                continue
 
         # 2-LEVEL GLUE
         if i + 1 < len(nodes):
@@ -309,40 +378,51 @@ def local_convert(text: str) -> Tuple[str, List[str], Dict[str, str]]:
                 r = LYRIC_PACK[duo_combo]
                 romaji_parts.append(r)
                 locked_words[duo_combo] = r
-                i += 2; continue
+                i += 2
+                continue
             db_hit = get_static_romaji(duo_combo)
             if db_hit:
                 romaji_parts.append(db_hit)
                 locked_words[duo_combo] = db_hit
-                i += 2; continue
+                i += 2
+                continue
 
         # PARTICLES
         if node.feature[0] == '助詞':
-            if word == 'は': romaji_parts.append('wa')
-            elif word == 'へ': romaji_parts.append('e')
-            elif word == 'を': romaji_parts.append('wo')
-            else: romaji_parts.append(kakasi_conv.do(word))
-            i += 1; continue
+            if word == 'は': 
+                romaji_parts.append('wa')
+            elif word == 'へ': 
+                romaji_parts.append('e')
+            elif word == 'を': 
+                romaji_parts.append('wo')
+            else: 
+                romaji_parts.append(kakasi_conv.do(word))
+            i += 1
+            continue
             
-        # LYRIC PACK
+        # LYRIC PACK (individual words)
         if word in LYRIC_PACK:
             r = LYRIC_PACK[word]
             romaji_parts.append(r)
             locked_words[word] = r
-            i += 1; continue
+            logger.debug(f"🔒 Lyric Pack: {word} -> {r}")
+            i += 1
+            continue
 
-        # DATABASE
+        # DATABASE + MECAB
         db_romaji = get_static_romaji(word)
         mecab_raw = node.feature[7] if len(node.feature) > 7 and node.feature[7] != '*' else word
         mecab_romaji = kakasi_conv.do(mecab_raw).strip()
         
         if db_romaji:
-            # Phonetic Guard
+            # Phonetic Guard: For single chars, check if DB is wildly different
             if len(word) == 1:
-                # If DB is wild (Genzai vs Ima), trust MeCab BUT lock it so AI doesn't hallucinate
-                if SequenceMatcher(None, db_romaji, mecab_romaji).ratio() < 0.3:
+                similarity = SequenceMatcher(None, db_romaji, mecab_romaji).ratio()
+                if similarity < 0.3:
+                    # DB is too different, trust MeCab but lock it
                     romaji_parts.append(mecab_romaji)
                     locked_words[word] = mecab_romaji
+                    logger.debug(f"🔒 MeCab Override: {word} -> {mecab_romaji} (DB: {db_romaji})")
                 else:
                     romaji_parts.append(db_romaji)
                     locked_words[word] = db_romaji
@@ -351,38 +431,121 @@ def local_convert(text: str) -> Tuple[str, List[str], Dict[str, str]]:
                 locked_words[word] = db_romaji
         else:
             romaji_parts.append(mecab_romaji)
+            # Lock single kanji even from MeCab to prevent AI hallucination
+            if len(word) == 1 and any('\u4e00' <= c <= '\u9fff' for c in word):
+                locked_words[word] = mecab_romaji
 
+        # Track words that need research
         if any('\u4e00' <= c <= '\u9fff' for c in word):
             research_targets.append(word)
+        
         i += 1
 
     draft = re.sub(r'\s+', ' ', " ".join(romaji_parts)).strip()
     return draft, list(set(research_targets)), locked_words
 
+# ===== VALIDATION =====
+
+def validate_romaji(original_jp: str, draft: str, final: str, locked: Dict) -> Tuple[str, List[str]]:
+    """
+    Validate AI output against locked words and hallucination patterns.
+    Returns: (validated_romaji, list_of_warnings)
+    """
+    warnings = []
+    validated = final
+    
+    # Check 1: Ensure locked words are still present
+    for jp_word, expected_rom in locked.items():
+        if jp_word in original_jp:
+            # Normalize for comparison
+            expected_lower = expected_rom.lower().replace("'", "").replace("-", "")
+            draft_lower = draft.lower().replace("'", "").replace("-", "")
+            final_lower = final.lower().replace("'", "").replace("-", "")
+            
+            if expected_lower in draft_lower and expected_lower not in final_lower:
+                warnings.append(f"Locked word missing: '{jp_word}' -> '{expected_rom}'")
+                validated = draft
+                logger.warning(f"⚠️ Validation: Locked word '{expected_rom}' for '{jp_word}' missing in AI output. Reverting to draft.")
+                return validated, warnings
+    
+    # Check 2: Detect common hallucinations
+    for correct, wrong in HALLUCINATION_PAIRS:
+        draft_has_correct = correct in draft.lower()
+        final_has_wrong = wrong in final.lower()
+        final_missing_correct = correct not in final.lower()
+        
+        if draft_has_correct and final_has_wrong and final_missing_correct:
+            warnings.append(f"Hallucination: {correct} -> {wrong}")
+            validated = draft
+            logger.warning(f"⚠️ Hallucination detected: {correct} became {wrong}. Reverting to draft.")
+            return validated, warnings
+    
+    # Check 3: Ensure no major length change (AI didn't go crazy)
+    draft_words = len(draft.split())
+    final_words = len(final.split())
+    if abs(draft_words - final_words) > max(3, draft_words * 0.3):
+        warnings.append(f"Length mismatch: {draft_words} words -> {final_words} words")
+        validated = draft
+        logger.warning(f"⚠️ Major length change detected. Reverting to draft.")
+        return validated, warnings
+    
+    return validated, warnings
+
+def log_conversion_details(text: str, draft: str, final: str, locked: Dict, method: str, warnings: List[str]):
+    """Log detailed conversion information for debugging"""
+    if draft != final or warnings:
+        logger.info(f"📝 CONVERSION for '{text[:50]}...'")
+        logger.info(f"   Draft:  {draft}")
+        logger.info(f"   Final:  {final}")
+        logger.info(f"   Method: {method}")
+        logger.info(f"   Locked: {len(locked)} words - {list(locked.keys())[:5]}")
+        if warnings:
+            logger.info(f"   ⚠️ Warnings: {warnings}")
+
+# ===== AI PROCESSING =====
+
 async def call_ai(client, model_id, prompt):
+    """Call AI with enhanced parameters for consistency"""
     try:
         resp = await client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
-            model=model_id, temperature=0.0, response_format={"type": "json_object"}, timeout=6.0
+            model=model_id, 
+            temperature=0.0,
+            top_p=0.1,  # More deterministic
+            response_format={"type": "json_object"}, 
+            timeout=8.0
         )
         return json.loads(resp.choices[0].message.content)
-    except: return None
+    except Exception as e:
+        logger.error(f"AI call failed: {e}")
+        return None
 
 async def process_text_guardian(text: str) -> Dict:
+    """Main processing pipeline with enhanced validation"""
     start = time.perf_counter()
-    cache_key = f"guardian_v32:{hashlib.md5(text.encode()).hexdigest()}"
+    cache_key = f"guardian_v33:{hashlib.md5(text.encode()).hexdigest()}"
     
-    if cache_key in l1_cache: return l1_cache[cache_key]
+    # Check L1 cache
+    if cache_key in l1_cache: 
+        return l1_cache[cache_key]
+    
+    # Check Redis cache
     if redis_client:
-        cached = await redis_client.get(cache_key)
-        if cached: return json.loads(cached)
+        try:
+            cached = await redis_client.get(cache_key)
+            if cached: 
+                return json.loads(cached)
+        except: pass
 
+    # Step 1: Local conversion with locking
     draft, research_needs, locked = local_convert(text)
     final_romaji = draft
     method = "local_db"
     official_match = False
+    warnings = []
+    confidence = "high"
     
-    # 1. SEARCH
+    # Step 2: Try to find official lyric match
     async with aiohttp.ClientSession() as session:
         official = await LyricSearchEngine.find_official_line(session, text)
         if official:
@@ -390,74 +553,212 @@ async def process_text_guardian(text: str) -> Dict:
             final_romaji = draft_off
             method = "official_match"
             official_match = True
+            logger.info(f"✅ Found official match for: {text[:30]}...")
     
-    # 2. AI REFINEMENT (WITH GUARDIAN LOCK)
-    if (research_needs and not official_match) and MODELS["deepseek"]["client"]:
-        # Guardian Logic: Construct a "Do Not Change" list for the AI
-        lock_instructions = ", ".join([f"{k}={v}" for k,v in locked.items() if len(k) < 4])
+    # Step 3: AI refinement (only if needed and no official match)
+    if research_needs and not official_match and MODELS["deepseek"]["client"]:
+        # Build comprehensive lock list
+        lock_examples = []
+        for jp, rom in list(locked.items())[:8]:  # Show 8 examples
+            lock_examples.append(f"  • '{jp}' = '{rom}'")
         
-        prompt = f"""Task: Fix Romaji.
-JP: {text}
-DRAFT: {draft}
-LOCKED (DO NOT CHANGE): {lock_instructions}
-RULES: 
-1. Fix ONLY grammar/particles. 
-2. Respect LOCKED words.
-3. 'ima' not 'genzai'.
-JSON: {{'corrected': 'string'}}"""
-        
-        data = await call_ai(MODELS["deepseek"]["client"], MODELS["deepseek"]["id"], prompt)
-        if data:
-            final_romaji = data.get("corrected", draft)
-            method = "deepseek_ai"
+        # Create detailed prompt with explicit examples
+        prompt = f"""You are an expert Romaji correction system. Your ONLY job is to fix obvious errors.
 
+ORIGINAL JAPANESE: {text}
+INITIAL ROMAJI: {draft}
+
+🔒 CRITICAL - THESE WORDS ARE LOCKED (NEVER CHANGE):
+{chr(10).join(lock_examples)}
+
+Full locked map: {json.dumps(locked, ensure_ascii=False)}
+
+📋 RULES (STRICT):
+1. Fix ONLY particles: は→wa, へ→e, を→wo
+2. Fix ONLY spacing issues
+3. NEVER change any locked word
+4. Prefer conversational readings:
+   - 今 = "ima" NOT "genzai"
+   - 今日 = "kyō" NOT "honjitsu" 
+   - 明日 = "ashita" NOT "myōnichi"
+   - 小部屋 = "kobeya" NOT "ko heya"
+5. If unsure, DON'T change it
+
+✅ EXAMPLES:
+Before: "watashiha ima ikimashou"
+After: "watashi wa ima ikimashou" (only fixed particle は→wa)
+
+Before: "kyō tabako wo suu"
+After: "kyō tabako wo suu" (no changes needed)
+
+Return JSON: {{"corrected": "final romaji", "changes": ["list what you changed"], "confidence": "high/medium/low"}}"""
+        
+        ai_data = await call_ai(MODELS["deepseek"]["client"], MODELS["deepseek"]["id"], prompt)
+        
+        if ai_data:
+            ai_output = ai_data.get("corrected", draft)
+            ai_changes = ai_data.get("changes", [])
+            confidence = ai_data.get("confidence", "medium")
+            
+            # CRITICAL: Validate AI output
+            validated, val_warnings = validate_romaji(text, draft, ai_output, locked)
+            warnings.extend(val_warnings)
+            
+            if not val_warnings:
+                # AI output passed validation
+                final_romaji = validated
+                method = "deepseek_validated"
+                logger.info(f"✅ AI refinement accepted: {ai_changes}")
+            else:
+                # AI output failed validation, using draft
+                final_romaji = draft
+                method = "local_db_validated"
+                confidence = "low"
+                logger.warning(f"❌ AI refinement rejected: {val_warnings}")
+    
+    # Final cleanup
+    final_romaji = re.sub(r'\s+', ' ', final_romaji).strip()
+    
+    # Log details
+    log_conversion_details(text, draft, final_romaji, locked, method, warnings)
+    
+    # Build result
     result = {
         "original": text,
-        "romaji": re.sub(r'\s+', ' ', final_romaji).strip(),
+        "romaji": final_romaji,
         "method": method,
-        "time": round(time.perf_counter()-start, 4)
+        "confidence": confidence,
+        "warnings": warnings,
+        "locked_words": len(locked),
+        "time": round(time.perf_counter() - start, 4)
     }
     
+    # Cache result
     l1_cache[cache_key] = result
-    if redis_client: await redis_client.setex(cache_key, 604800, json.dumps(result))
+    if redis_client:
+        try:
+            await redis_client.setex(cache_key, 604800, json.dumps(result))
+        except: pass
+    
     return result
+
+# ===== TEST SUITE =====
+
+TEST_CASES = [
+    ("今は無理", "ima wa muri"),
+    ("小部屋に入る", "kobeya ni hairu"),
+    ("今日は晴れ", "kyō wa hare"),
+    ("煙草を吸う", "tabako wo suu"),
+    ("明日会いましょう", "ashita aimashō"),
+    ("運命の人", "unmei no hito"),
+    ("約束を守る", "yakusoku wo mamoru"),
+    ("私は学生です", "watashi wa gakusei desu"),
+    ("君の名前は", "kimi no namae wa"),
+    ("心から感謝", "kokoro kara kansha"),
+]
+
+@app.get("/test")
+async def run_tests():
+    """Run test suite to measure quality"""
+    results = []
+    passed_count = 0
+    
+    for jp, expected in TEST_CASES:
+        result = await process_text_guardian(jp)
+        actual = result["romaji"].lower().replace("'", "").replace("-", "")
+        expected_norm = expected.lower().replace("'", "").replace("-", "")
+        
+        passed = actual == expected_norm
+        if passed:
+            passed_count += 1
+        
+        results.append({
+            "input": jp,
+            "expected": expected,
+            "got": result["romaji"],
+            "passed": passed,
+            "method": result["method"],
+            "confidence": result.get("confidence", "unknown"),
+            "warnings": result.get("warnings", [])
+        })
+    
+    return {
+        "total": len(TEST_CASES),
+        "passed": passed_count,
+        "failed": len(TEST_CASES) - passed_count,
+        "pass_rate": f"{(passed_count/len(TEST_CASES)*100):.1f}%",
+        "results": results
+    }
+
+# ===== API ENDPOINTS =====
 
 @app.get("/convert")
 async def convert(text: str):
-    if not text: raise HTTPException(400)
+    """Convert single Japanese text to Romaji"""
+    if not text: 
+        raise HTTPException(400, "Text parameter required")
     return await process_text_guardian(text)
 
 @app.post("/convert-batch")
 async def convert_batch(lines: List[str]):
+    """Convert multiple lines in parallel"""
     return await asyncio.gather(*[process_text_guardian(l) for l in lines])
+
+@app.get("/lookup")
+def lookup(word: str):
+    """Debug: Look up a word in database and manual dict"""
+    return {
+        "word": word,
+        "db_romaji": get_static_romaji(word),
+        "manual_romaji": LYRIC_PACK.get(word),
+        "compound_priority": COMPOUND_PRIORITY.get(word),
+        "in_lyric_pack": word in LYRIC_PACK
+    }
 
 @app.post("/force-rebuild")
 async def force_rebuild(secret: str):
-    if secret != ADMIN_SECRET: raise HTTPException(403)
-    if os.path.exists(DB_FILE): os.remove(DB_FILE)
+    """Admin: Force database rebuild"""
+    if secret != ADMIN_SECRET: 
+        raise HTTPException(403, "Unauthorized")
+    if os.path.exists(DB_FILE): 
+        os.remove(DB_FILE)
     asyncio.create_task(background_builder())
     return {"status": "Background Rebuild Started"}
 
 @app.post("/clear-cache")
 async def clear_cache(secret: str):
-    if secret != ADMIN_SECRET: raise HTTPException(403)
+    """Admin: Clear all caches"""
+    if secret != ADMIN_SECRET: 
+        raise HTTPException(403, "Unauthorized")
     global l1_cache
     l1_cache = {}
-    if redis_client: await redis_client.flushdb()
+    if redis_client: 
+        try:
+            await redis_client.flushdb()
+        except: pass
     return {"status": "Cache Cleared"}
 
-# NEW DEBUG ENDPOINT
-@app.get("/lookup")
-def lookup(word: str):
+@app.get("/stats")
+def stats():
+    """Get system statistics"""
     return {
-        "word": word,
-        "db_romaji": get_static_romaji(word),
-        "manual_romaji": LYRIC_PACK.get(word)
+        "version": "33.0.0",
+        "db_size": check_db_status(),
+        "cache_size": len(l1_cache),
+        "lyric_pack_size": len(LYRIC_PACK),
+        "compound_priority_size": len(COMPOUND_PRIORITY),
+        "models_available": [k for k, v in MODELS.items() if v["client"]],
+        "redis_connected": redis_client is not None
     }
 
 @app.get("/")
 def root():
-    return {"status": "GUARDIAN_ONLINE", "db_size": check_db_status()}
+    """Health check"""
+    return {
+        "status": "GUARDIAN_ENHANCED_ONLINE",
+        "version": "33.0.0", 
+        "db_size": check_db_status()
+    }
 
 if __name__ == "__main__":
     import uvicorn
