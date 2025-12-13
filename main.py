@@ -81,7 +81,7 @@ MODELS = {
 # ===== COMPOUND PRIORITY =====
 # These MUST be kept together as single units
 COMPOUND_PRIORITY = {
-    "小部屋": "kobeya",      # NOT "ko heya"
+    "小部屋": "kobeya",      # NOT "ko heya" or "kob e ya"
     "煙草": "tabako",        # NOT "kemuri kusa"
     "たばこ": "tabako",
     "タバコ": "tabako",
@@ -97,22 +97,78 @@ COMPOUND_PRIORITY = {
     "先月": "sengetsu",
     "今月": "kongetsu",
     "来月": "raigetsu",
-    "学生": "gakusei",       # NOT "gakushou"
-    "人": "hito",            # NOT "nin" or "jin"
+    "学生": "gakusei",       # NOT "gakushou" or "ga kusei"
+    "人": "hito",            # NOT "nin" or "jin" or "hi to"
+    "私": "watashi",         # NOT "wa tashi"
+    "名前": "namae",         # NOT "nama e"
+    "約束": "yakusoku",      # NOT "ya kusoku"
+    "感謝": "kansha",        # NOT "ka nsha"
+    "無理": "muri",
+    "晴れ": "hare",          # NOT "har e"
 }
 
 # ===== BASIC READINGS =====
-# Common kanji that often get misread
+# Common kanji that often get misread - EXPANDED
 BASIC_READINGS = {
+    # Particles & common verbs
     "に": "ni",
+    "で": "de",
+    "と": "to",
+    "か": "ka",
+    "が": "ga",
+    "の": "no",
+    "や": "ya",
+    "も": "mo",
+    "ね": "ne",
+    "よ": "yo",
+    
+    # Verbs
     "入る": "hairu",
     "会う": "au",
     "吸う": "suu",
     "守る": "mamoru",
+    "する": "suru",
+    "いる": "iru",
+    "ある": "aru",
+    "行く": "iku",
+    "来る": "kuru",
+    "見る": "miru",
+    "聞く": "kiku",
+    "話す": "hanasu",
+    "食べる": "taberu",
+    "飲む": "nomu",
+    "書く": "kaku",
+    "読む": "yomu",
+    "寝る": "neru",
+    "起きる": "okiru",
+    
+    # Common nouns
     "学生": "gakusei",
     "人": "hito",
     "名前": "namae",
     "感謝": "kansha",
+    "晴れ": "hare",
+    "雨": "ame",
+    "雪": "yuki",
+    "風": "kaze",
+    "時": "toki",
+    "日": "hi",
+    "年": "toshi",
+    "月": "tsuki",
+    "火": "hi",
+    "水": "mizu",
+    "木": "ki",
+    "金": "kin",
+    "土": "tsuchi",
+    
+    # Adverbs & others
+    "から": "kara",
+    "まで": "made",
+    "です": "desu",
+    "ます": "masu",
+    "ません": "masen",
+    "でした": "deshita",
+    "ましょう": "mashō",
 }
 
 # ===== LYRIC PACK (LOCKED WORDS) =====
@@ -336,29 +392,47 @@ class LyricSearchEngine:
 
 def fix_spacing(romaji: str) -> str:
     """
-    Fix spacing issues in romaji text.
-    Ensures particles have proper spacing around them.
+    Final pass spacing cleanup - handles edge cases only.
+    Main spacing is done by smart_join_romaji.
     """
-    # Common particles that need spacing
-    particles = ['wa', 'wo', 'ni', 'de', 'to', 'ka', 'ga', 'no', 'e', 'ya', 'mo', 'ne', 'yo']
-    
     result = romaji
     
-    # First pass: Add spaces around particles
-    for particle in particles:
-        # Match particle that's not part of a longer word
-        # Add space before if preceded by letter and no space
-        pattern = f'([a-zōūāē]){particle}(?![a-zōūāē])'
-        result = re.sub(pattern, f'\\1 {particle}', result)
-        
-        # Add space after if followed by letter and no space  
-        pattern = f'(?<![a-zōūāē]){particle}([a-zōūāē])'
-        result = re.sub(pattern, f'{particle} \\1', result)
+    # Only fix obvious cases where particles are stuck together
+    # Pattern: letter + wo + letter with no spaces
+    result = re.sub(r'([a-zōūāē]{2,})wo([a-zōūāē]{2,})', r'\1 wo \2', result)
+    result = re.sub(r'([a-zōūāē]{2,})no([a-zōūāē]{2,})', r'\1 no \2', result)
+    
+    # Fix は as particle when it should be wa
+    result = re.sub(r'\bha\b', 'wa', result)
     
     # Clean up multiple spaces
     result = re.sub(r'\s+', ' ', result).strip()
     
     return result
+
+def smart_join_romaji(parts: List[str], particle_positions: List[bool]) -> str:
+    """
+    Smart joining that respects word boundaries.
+    particle_positions[i] = True if parts[i] is a particle
+    """
+    if not parts:
+        return ""
+    
+    result = []
+    for i, part in enumerate(parts):
+        # Add the part
+        result.append(part)
+        
+        # Decide if we need space after this part
+        if i < len(parts) - 1:  # Not the last part
+            current_is_particle = particle_positions[i] if i < len(particle_positions) else False
+            next_is_particle = particle_positions[i+1] if i+1 < len(particle_positions) else False
+            
+            # Add space after particle or before particle
+            if current_is_particle or next_is_particle:
+                result.append(' ')
+    
+    return ''.join(result)
 
 def local_convert(text: str) -> Tuple[str, List[str], Dict[str, str]]:
     """
@@ -369,6 +443,7 @@ def local_convert(text: str) -> Tuple[str, List[str], Dict[str, str]]:
         return text, [], {}
     
     romaji_parts = []
+    particle_positions = []  # Track which parts are particles
     research_targets = []
     locked_words = {}  # Words that MUST NOT be changed by AI
     
@@ -389,6 +464,7 @@ def local_convert(text: str) -> Tuple[str, List[str], Dict[str, str]]:
                 if combo in COMPOUND_PRIORITY:
                     r = COMPOUND_PRIORITY[combo]
                     romaji_parts.append(r)
+                    particle_positions.append(False)
                     locked_words[combo] = r
                     logger.debug(f"🔒 Compound Priority: {combo} -> {r}")
                     i += length
@@ -404,12 +480,14 @@ def local_convert(text: str) -> Tuple[str, List[str], Dict[str, str]]:
             if tri_combo in LYRIC_PACK:
                 r = LYRIC_PACK[tri_combo]
                 romaji_parts.append(r)
+                particle_positions.append(False)
                 locked_words[tri_combo] = r
                 i += 3
                 continue
             db_hit = get_static_romaji(tri_combo)
             if db_hit:
                 romaji_parts.append(db_hit)
+                particle_positions.append(False)
                 locked_words[tri_combo] = db_hit
                 i += 3
                 continue
@@ -420,17 +498,19 @@ def local_convert(text: str) -> Tuple[str, List[str], Dict[str, str]]:
             if duo_combo in LYRIC_PACK:
                 r = LYRIC_PACK[duo_combo]
                 romaji_parts.append(r)
+                particle_positions.append(False)
                 locked_words[duo_combo] = r
                 i += 2
                 continue
             db_hit = get_static_romaji(duo_combo)
             if db_hit:
                 romaji_parts.append(db_hit)
+                particle_positions.append(False)
                 locked_words[duo_combo] = db_hit
                 i += 2
                 continue
 
-        # PARTICLES
+        # PARTICLES - NO SPACE BEFORE, ADD AFTER
         if node.feature[0] == '助詞':
             if word == 'は': 
                 romaji_parts.append('wa')
@@ -440,6 +520,7 @@ def local_convert(text: str) -> Tuple[str, List[str], Dict[str, str]]:
                 romaji_parts.append('wo')
             else: 
                 romaji_parts.append(kakasi_conv.do(word))
+            particle_positions.append(True)  # Mark as particle
             i += 1
             continue
             
@@ -447,6 +528,7 @@ def local_convert(text: str) -> Tuple[str, List[str], Dict[str, str]]:
         if word in LYRIC_PACK:
             r = LYRIC_PACK[word]
             romaji_parts.append(r)
+            particle_positions.append(False)
             locked_words[word] = r
             logger.debug(f"🔒 Lyric Pack: {word} -> {r}")
             i += 1
@@ -464,16 +546,20 @@ def local_convert(text: str) -> Tuple[str, List[str], Dict[str, str]]:
                 if similarity < 0.3:
                     # DB is too different, trust MeCab but lock it
                     romaji_parts.append(mecab_romaji)
+                    particle_positions.append(False)
                     locked_words[word] = mecab_romaji
                     logger.debug(f"🔒 MeCab Override: {word} -> {mecab_romaji} (DB: {db_romaji})")
                 else:
                     romaji_parts.append(db_romaji)
+                    particle_positions.append(False)
                     locked_words[word] = db_romaji
             else:
                 romaji_parts.append(db_romaji)
+                particle_positions.append(False)
                 locked_words[word] = db_romaji
         else:
             romaji_parts.append(mecab_romaji)
+            particle_positions.append(False)
             # Lock single kanji even from MeCab to prevent AI hallucination
             if len(word) == 1 and any('\u4e00' <= c <= '\u9fff' for c in word):
                 locked_words[word] = mecab_romaji
@@ -484,8 +570,9 @@ def local_convert(text: str) -> Tuple[str, List[str], Dict[str, str]]:
         
         i += 1
 
-    draft = re.sub(r'\s+', ' ', " ".join(romaji_parts)).strip()
-    draft = fix_spacing(draft)  # Apply spacing fixes
+    # Use smart joining instead of simple join
+    draft = smart_join_romaji(romaji_parts, particle_positions)
+    draft = re.sub(r'\s+', ' ', draft).strip()
     return draft, list(set(research_targets)), locked_words
 
 # ===== VALIDATION =====
@@ -778,21 +865,32 @@ def lookup(word: str):
 @app.get("/debug")
 async def debug_convert(text: str):
     """Debug: Show detailed conversion steps"""
-    draft, research_needs, locked = local_convert(text)
-    
-    return {
-        "input": text,
-        "draft_romaji": draft,
-        "locked_words": locked,
-        "research_needed": research_needs,
-        "locked_count": len(locked),
-        "steps": {
-            "1_tokenization": f"{len(list(tagger(text)))} tokens" if tagger else "N/A",
-            "2_glue_logic": "Compound Priority → 3-Level → 2-Level → Particles → Individual",
-            "3_locking": f"{len(locked)} words locked",
-            "4_spacing": "Applied fix_spacing()"
+    try:
+        draft, research_needs, locked = local_convert(text)
+        
+        token_count = 0
+        if tagger:
+            try:
+                token_count = len(list(tagger(text)))
+            except:
+                token_count = 0
+        
+        return {
+            "input": text,
+            "draft_romaji": draft,
+            "locked_words": locked,
+            "research_needed": research_needs,
+            "locked_count": len(locked),
+            "steps": {
+                "1_tokenization": f"{token_count} tokens" if token_count > 0 else "N/A",
+                "2_glue_logic": "Compound Priority → 3-Level → 2-Level → Particles → Individual",
+                "3_locking": f"{len(locked)} words locked",
+                "4_spacing": "Applied fix_spacing()"
+            }
         }
-    }
+    except Exception as e:
+        logger.error(f"Debug error: {e}")
+        return {"error": str(e), "input": text}
 
 @app.post("/force-rebuild")
 async def force_rebuild(secret: str):
