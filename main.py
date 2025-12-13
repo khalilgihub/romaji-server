@@ -55,7 +55,7 @@ MODELS_CONFIG = {
         "enabled": bool(GROQ_API_KEY)
     },
     "gemini": {
-        "name": "gemini-1.5-flash-latest",  # Correct model name
+        "name": "gemini-2.5-flash",  # UPDATED: Current stable model
         "provider": "gemini",
         "base_url": None,
         "weight": 1.0,
@@ -209,7 +209,7 @@ def setup_ai_clients():
             genai.configure(api_key=GEMINI_API_KEY)
             # Use the latest stable model
             gemini_model = genai.GenerativeModel(
-                model_name="gemini-1.5-flash-latest",
+                model_name=MODELS_CONFIG["gemini"]["name"], # UPDATED: Use config name
                 generation_config={
                     "temperature": 0.05,
                     "top_p": 0.95,
@@ -217,7 +217,7 @@ def setup_ai_clients():
                     "max_output_tokens": 1024,
                 }
             )
-            logger.info("✅ Gemini initialized (FREE)")
+            logger.info(f"✅ Gemini initialized ({MODELS_CONFIG['gemini']['name']})")
         except Exception as e:
             logger.error(f"❌ Gemini failed: {e}")
     
@@ -443,7 +443,7 @@ Respond ONLY with valid JSON (no markdown, no code blocks):
         
         result = json.loads(text)
         result["model"] = "gemini"
-        result["model_name"] = "gemini-1.5-flash-latest"
+        result["model_name"] = MODELS_CONFIG["gemini"]["name"] # UPDATED: Dynamic name
         return result
     except asyncio.TimeoutError:
         logger.error("❌ Gemini validation timeout")
@@ -705,7 +705,7 @@ async def root():
             "details": {
                 "deepseek": f"✅ {MODELS_CONFIG['deepseek']['name']}" if MODELS_CONFIG['deepseek']['enabled'] else "❌ Not configured",
                 "groq": f"✅ {MODELS_CONFIG['llama-groq']['name']} (FREE)" if MODELS_CONFIG['llama-groq']['enabled'] else "❌ Not configured",
-                "gemini": f"✅ gemini-1.5-flash-latest (FREE)" if MODELS_CONFIG['gemini']['enabled'] else "❌ Not configured"
+                "gemini": f"✅ {MODELS_CONFIG['gemini']['name']} (FREE)" if MODELS_CONFIG['gemini']['enabled'] else "❌ Not configured"
             }
         },
         "components": {
@@ -853,7 +853,7 @@ async def test_models():
             result = await validate_with_gemini(test_japanese, test_romaji, [])
             results["gemini"] = {
                 "status": "✅ Working",
-                "model_name": "gemini-1.5-flash-latest",
+                "model_name": MODELS_CONFIG["gemini"]["name"], # UPDATED: Dynamic name
                 "response": result
             }
         except Exception as e:
