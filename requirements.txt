@@ -1,8 +1,7 @@
 fastapi
 uvicorn[standard]
 requests
-openai 
-google-generativeai 
+openai
 beautifulsoup4
 redis
 fugashi
