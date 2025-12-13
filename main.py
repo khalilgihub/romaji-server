@@ -1,10 +1,10 @@
 """
-MULTI-MODEL REAL-TIME ROMAJI ENGINE (v8.0-SPEED)
+MULTI-MODEL REAL-TIME ROMAJI ENGINE (v8.1-FIXED)
 Powered by Async DeepSeek + Groq + Parallel Dictionary Lookups
 Designed for Zero-Latency Music/Lyrics Applications
 """
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from openai import AsyncOpenAI
 import os
 import re
@@ -15,8 +15,8 @@ from bs4 import BeautifulSoup
 import asyncio
 import time
 from fastapi.middleware.cors import CORSMiddleware
-from dataclasses import dataclass, asdict
-from typing import List, Optional, Dict
+from dataclasses import dataclass
+from typing import List, Optional, Dict, Tuple  # <--- FIXED: Added Tuple
 import logging
 import urllib.parse
 import aiohttp
@@ -28,7 +28,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Real-Time Romaji Engine", version="8.0.0-SPEED")
+app = FastAPI(title="Real-Time Romaji Engine", version="8.1.0-FIXED")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # ===== CONFIGURATION =====
@@ -56,13 +56,6 @@ MODELS_CONFIG = {
         "enabled": bool(GROQ_API_KEY)
     }
 }
-
-# Data Models
-@dataclass
-class WordAnalysis:
-    surface: str
-    reading: Optional[str]
-    romaji: Optional[str]
 
 # Globals
 ai_clients = {}
