@@ -448,13 +448,63 @@ def local_convert(text: str) -> Tuple[str, List[str], Dict[str, str]]:
     locked_words = {}  # Words that MUST NOT be changed by AI
     
     text = text.replace("　", " ")
+    
+    # PRE-SCAN: Find compound words in original text BEFORE tokenization
+    # This prevents MeCab from splitting them
+    compound_positions = {}  # {char_index: (compound_text, romaji, length)}
+    
+    for compound, romaji in sorted(COMPOUND_PRIORITY.items(), key=lambda x: -len(x[0])):
+        # Search for this compound in the text
+        idx = 0
+        while idx < len(text):
+            pos = text.find(compound, idx)
+            if pos == -1:
+                break
+            
+            # Check if this position is already covered by a longer compound
+            overlaps = False
+            for existing_pos, (_, _, length) in compound_positions.items():
+                if existing_pos <= pos < existing_pos + length:
+                    overlaps = True
+                    break
+            
+            if not overlaps:
+                compound_positions[pos] = (compound, romaji, len(compound))
+                logger.debug(f"🔒 Pre-scan found: {compound} at pos {pos} -> {romaji}")
+            
+            idx = pos + 1
+    
+    # Now tokenize
     nodes = list(tagger(text))
     i = 0
+    char_position = 0  # Track character position in original text
+    # Now tokenize
+    nodes = list(tagger(text))
+    i = 0
+    char_position = 0  # Track character position in original text
     
     while i < len(nodes):
         node = nodes[i]
         word = node.surface
+        
+        # Check if this position is covered by a pre-scanned compound
+        if char_position in compound_positions:
+            compound_text, compound_romaji, compound_len = compound_positions[char_position]
+            romaji_parts.append(compound_romaji)
+            particle_positions.append(False)
+            locked_words[compound_text] = compound_romaji
+            logger.debug(f"✅ Using pre-scanned: {compound_text} -> {compound_romaji}")
+            
+            # Skip tokens that are part of this compound
+            chars_to_skip = compound_len
+            while i < len(nodes) and chars_to_skip > 0:
+                chars_to_skip -= len(nodes[i].surface)
+                char_position += len(nodes[i].surface)
+                i += 1
+            continue
+        
         matched = False
+        char_position += len(word)
         
         # PRIORITY: Check COMPOUND_PRIORITY first (before any other glue)
         # This ensures compounds like 小部屋 stay together
@@ -470,43 +520,28 @@ def local_convert(text: str) -> Tuple[str, List[str], Dict[str, str]]:
                     i += length
                     matched = True
                     break
+        processed_chars = word_end
+        matched = False
         
-        if matched:
-            continue
-
-        # 3-LEVEL GLUE (for non-priority compounds)
+        # 3-LEVEL GLUE (for non-priority compounds that weren't pre-scanned)
         if i + 2 < len(nodes):
             tri_combo = word + nodes[i+1].surface + nodes[i+2].surface
-            if tri_combo in LYRIC_PACK:
+            if tri_combo in LYRIC_PACK and tri_combo not in COMPOUND_PRIORITY:
                 r = LYRIC_PACK[tri_combo]
                 romaji_parts.append(r)
                 particle_positions.append(False)
                 locked_words[tri_combo] = r
                 i += 3
                 continue
-            db_hit = get_static_romaji(tri_combo)
-            if db_hit:
-                romaji_parts.append(db_hit)
-                particle_positions.append(False)
-                locked_words[tri_combo] = db_hit
-                i += 3
-                continue
 
         # 2-LEVEL GLUE
         if i + 1 < len(nodes):
             duo_combo = word + nodes[i+1].surface
-            if duo_combo in LYRIC_PACK:
+            if duo_combo in LYRIC_PACK and duo_combo not in COMPOUND_PRIORITY:
                 r = LYRIC_PACK[duo_combo]
                 romaji_parts.append(r)
                 particle_positions.append(False)
                 locked_words[duo_combo] = r
-                i += 2
-                continue
-            db_hit = get_static_romaji(duo_combo)
-            if db_hit:
-                romaji_parts.append(db_hit)
-                particle_positions.append(False)
-                locked_words[duo_combo] = db_hit
                 i += 2
                 continue
 
