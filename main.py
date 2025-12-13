@@ -1,11 +1,11 @@
 """
-ULTIMATE ROMAJI ENGINE (v19.0-UNIVERSE)
-"The 1 Million Word Edition"
+ULTIMATE ROMAJI ENGINE (v21.0-HYPER-SQL)
+"The 1 Million Word Edition (RAM Safe)"
 
 Features:
+- SQLITE STORAGE: Stores 1,000,000+ words on disk instead of RAM.
 - UNIVERSE BUILDER: Downloads EDICT (Words) + ENAMDICT (Names).
-- TOTAL VOCABULARY: ~950,000 - 1,000,000 entries.
-- NAME RECOGNITION: Expert at anime character names and places.
+- ZERO CRASHES: Runs easily on free 512MB servers.
 - SINGULARITY MODE: AI Tribunal handles context.
 """
 
@@ -25,14 +25,14 @@ import urllib.parse
 import aiohttp
 import requests
 import gzip
-import io
-import gc # Garbage Collection
+import sqlite3
+import gc
 
 # ===== LOGGING & SETUP =====
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
-logger = logging.getLogger("RomajiUniverse")
+logger = logging.getLogger("RomajiHyperSQL")
 
-app = FastAPI(title="Romaji Universe", version="19.0.0")
+app = FastAPI(title="Romaji Hyper-SQL", version="21.0.0")
 app.add_middleware(
     CORSMiddleware, 
     allow_origins=["*"], 
@@ -46,6 +46,7 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 REDIS_URL = os.environ.get("REDIS_URL")
 ADMIN_SECRET = "admin123"
+DB_FILE = "titan_universe.db"
 
 MODELS = {
     "deepseek": {
@@ -62,11 +63,10 @@ MODELS = {
     }
 }
 
-# ===== UNIVERSE BUILDER (1,000,000 Entries) =====
+# ===== BUILDER (1,000,000 Entries to SQL) =====
 EDICT_URL = "http://ftp.edrdg.org/pub/Nihongo/edict.gz"
 ENAMDICT_URL = "http://ftp.edrdg.org/pub/Nihongo/enamdict.gz"
 
-# Manual Lyrics Pack (Overrides generic dictionary entries)
 LYRIC_PACK = {
     "運命": "unmei", "奇跡": "kiseki", "約束": "yakusoku", "記憶": "kioku",
     "物語": "monogatari", "伝説": "densetsu", "永遠": "eien", "瞬間": "shunkan",
@@ -83,23 +83,30 @@ LYRIC_PACK = {
     "私": "watashi", "僕": "boku", "俺": "ore", "君": "kimi", "貴方": "anata"
 }
 
-def parse_edrdg_file(url, label, converter, target_dict):
-    """Downloads and parses an EDRDG dictionary file (Edict/Enamdict)"""
+def init_db():
+    """Create SQLite table"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('CREATE TABLE IF NOT EXISTS dictionary (word TEXT PRIMARY KEY, romaji TEXT)')
+    conn.commit()
+    return conn
+
+def populate_from_url(url, label, converter, conn):
     try:
-        logger.info(f"⬇️ Downloading {label} from {url}...")
-        response = requests.get(url, timeout=60)
-        
-        if response.status_code == 200:
+        logger.info(f"⬇️ Downloading {label}...")
+        resp = requests.get(url, timeout=60)
+        if resp.status_code == 200:
             logger.info(f"📦 Parsing {label}...")
-            content = gzip.decompress(response.content).decode("euc-jp", errors="ignore")
+            content = gzip.decompress(resp.content).decode("euc-jp", errors="ignore")
             
+            c = conn.cursor()
+            batch = []
             count = 0
+            
             for line in content.splitlines():
                 try:
-                    # Format: KANJI [KANA] /meaning/
                     parts = line.split(" /")
                     header = parts[0]
-                    
                     word = ""
                     reading = ""
                     
@@ -113,29 +120,29 @@ def parse_edrdg_file(url, label, converter, target_dict):
                         reading = word
                         
                     if word and reading:
-                        # Optimization: Filter out extremely long phrases (>12 chars) to save RAM
-                        if len(word) < 12:
-                            # Direct check to avoid slow pykakasi calls for every line if possible
-                            # But we need romaji, so we must convert.
-                            # WARNING: 1M conversions is slow. 
-                            # We trust PyKakasi speed.
-                            romaji = converter.do(reading).strip()
-                            target_dict[word] = romaji
-                            count += 1
+                        # PyKakasi is slow, but we only do this ONCE during build
+                        romaji = converter.do(reading).strip()
+                        batch.append((word, romaji))
+                        count += 1
+                        
+                        if len(batch) >= 5000:
+                            c.executemany('INSERT OR IGNORE INTO dictionary VALUES (?,?)', batch)
+                            conn.commit()
+                            batch = []
                 except: continue
             
-            logger.info(f"✅ {label} Parsed: {count} entries added.")
-            del content # Free memory immediately
-            gc.collect() # Force garbage collection
-        else:
-            logger.error(f"❌ Failed to download {label}: Status {response.status_code}")
-            
+            if batch:
+                c.executemany('INSERT OR IGNORE INTO dictionary VALUES (?,?)', batch)
+                conn.commit()
+                
+            logger.info(f"✅ {label} Complete. Added ~{count} words.")
+            del content
+            gc.collect()
     except Exception as e:
-        logger.error(f"⚠️ {label} Build Failed: {e}")
+        logger.error(f"⚠️ {label} Failed: {e}")
 
-def build_universe():
-    """Builds the 1 Million Word Dictionary"""
-    logger.info("🌌 UNIVERSE: Starting 1,000,000+ Word Build...")
+def build_universe_sql():
+    logger.info("🌌 UNIVERSE SQL: Building 1,000,000+ DB...")
     
     import pykakasi
     k = pykakasi.kakasi()
@@ -145,69 +152,65 @@ def build_universe():
     k.setMode("r", "Hepburn")
     conv = k.getConverter()
     
-    new_db = {}
+    conn = init_db()
     
-    # 1. Download EDICT (Words) ~180k
-    parse_edrdg_file(EDICT_URL, "EDICT (Words)", conv, new_db)
+    # 1. EDICT (Words)
+    populate_from_url(EDICT_URL, "EDICT", conv, conn)
     
-    # 2. Download ENAMDICT (Names) ~740k
-    # Note: This is huge. We append to the same db.
-    parse_edrdg_file(ENAMDICT_URL, "ENAMDICT (Names)", conv, new_db)
+    # 2. ENAMDICT (Names)
+    populate_from_url(ENAMDICT_URL, "ENAMDICT", conv, conn)
     
-    # 3. Inject Lyrics (Priority Override)
-    new_db.update(LYRIC_PACK)
+    # 3. Lyrics
+    c = conn.cursor()
+    for w, r in LYRIC_PACK.items():
+        c.execute('INSERT OR REPLACE INTO dictionary VALUES (?,?)', (w, r))
+    conn.commit()
+    conn.close()
     
-    # 4. Save to Disk
-    try:
-        logger.info("💾 Saving to disk (this may take a moment)...")
-        with open("titan_dictionary.json", "w", encoding="utf-8") as f:
-            json.dump(new_db, f, ensure_ascii=False)
-        logger.info(f"✅ UNIVERSE BUILD COMPLETE. Total Size: {len(new_db)} words.")
-        return new_db
-    except Exception as e:
-        logger.error(f"❌ Save failed: {e}")
-        return LYRIC_PACK
+    logger.info("✅ UNIVERSE DB BUILT.")
 
-# ===== GLOBAL STORAGE =====
-STATIC_OVERRIDES = {} 
+# ===== DB LOOKUP =====
+def get_static_romaji(word):
+    """Fast SQL Lookup"""
+    try:
+        # Connect per request/thread to be safe
+        with sqlite3.connect(DB_FILE) as conn:
+            c = conn.cursor()
+            c.execute('SELECT romaji FROM dictionary WHERE word=?', (word,))
+            res = c.fetchone()
+            if res: return res[0]
+    except: return None
+    return None
+
+def check_db_status():
+    if not os.path.exists(DB_FILE):
+        return 0
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            c = conn.cursor()
+            c.execute('SELECT count(*) FROM dictionary')
+            return c.fetchone()[0]
+    except: return 0
+
+# ===== GLOBAL SETUP =====
 redis_client = None
 tagger = None
 kakasi_conv = None
 l1_cache = {}
 
-def load_or_build():
-    global STATIC_OVERRIDES
-    if os.path.exists("titan_dictionary.json"):
-        try:
-            logger.info("📂 Loading Dictionary from Disk...")
-            with open("titan_dictionary.json", "r", encoding="utf-8") as f:
-                STATIC_OVERRIDES = json.load(f)
-            
-            # If dictionary is too small (<100k), force rebuild to get UNIVERSE
-            if len(STATIC_OVERRIDES) < 100000:
-                logger.info("⚠️ Dictionary too small. Upgrading to UNIVERSE...")
-                STATIC_OVERRIDES = build_universe()
-            else:
-                logger.info(f"✅ UNIVERSE LOADED: {len(STATIC_OVERRIDES)} entries")
-        except:
-            STATIC_OVERRIDES = build_universe()
-    else:
-        STATIC_OVERRIDES = build_universe()
-
 def init_globals():
     global tagger, kakasi_conv, redis_client, MODELS
     
-    # 1. Load Dictionary
-    load_or_build()
-
-    # 2. MeCab
+    # Check if DB exists, if not build it
+    if check_db_status() < 5000:
+        build_universe_sql()
+        
     try:
         import fugashi
         import unidic_lite
         tagger = fugashi.Tagger(f'-d {unidic_lite.DICDIR}')
     except: logger.error("❌ MeCab Failed")
 
-    # 3. Kakasi
     try:
         import pykakasi
         k = pykakasi.kakasi()
@@ -218,12 +221,10 @@ def init_globals():
         kakasi_conv = k.getConverter()
     except: logger.error("❌ Kakasi Failed")
 
-    # 4. AI Clients
     for name, conf in MODELS.items():
         if conf["key"]:
             conf["client"] = AsyncOpenAI(api_key=conf["key"], base_url=conf["base"])
 
-    # 5. Redis
     if REDIS_URL:
         try:
             redis_client = redis.from_url(REDIS_URL, decode_responses=True)
@@ -232,12 +233,12 @@ def init_globals():
 
 init_globals()
 
-# ===== RESEARCH ENGINE =====
+# ===== RESEARCH & LOGIC =====
 
 class ResearchEngine:
     @staticmethod
     async def fetch_jisho(session: aiohttp.ClientSession, word: str) -> Optional[Dict]:
-        if word in STATIC_OVERRIDES: return None
+        if get_static_romaji(word): return None
         url = f"https://jisho.org/api/v1/search/words?keyword={urllib.parse.quote(word)}"
         try:
             async with session.get(url, timeout=2.5) as resp:
@@ -264,8 +265,6 @@ class ResearchEngine:
                     forced[r['word']] = r['reading']
             return "\n".join(notes), forced
 
-# ===== CORE LOGIC =====
-
 def local_convert(text: str) -> Tuple[str, List[str]]:
     if not tagger or not kakasi_conv: return text, []
     romaji_parts, research_targets = [], []
@@ -275,9 +274,10 @@ def local_convert(text: str) -> Tuple[str, List[str]]:
         word = node.surface
         if not word: continue
         
-        # 1. CHECK UNIVERSE DICTIONARY
-        if word in STATIC_OVERRIDES:
-            romaji_parts.append(STATIC_OVERRIDES[word])
+        # 1. CHECK SQL DB (Fast & Huge)
+        db_hit = get_static_romaji(word)
+        if db_hit:
+            romaji_parts.append(db_hit)
             continue
             
         # 2. Particles
@@ -293,7 +293,7 @@ def local_convert(text: str) -> Tuple[str, List[str]]:
         roma = kakasi_conv.do(reading) if reading else kakasi_conv.do(word)
         romaji_parts.append(roma)
 
-        # 4. Unknowns (Should be nearly zero now)
+        # 4. Unknowns
         if any('\u4e00' <= c <= '\u9fff' for c in word):
             research_targets.append(word)
 
@@ -309,9 +309,9 @@ async def call_ai(client, model_id, prompt):
         return json.loads(resp.choices[0].message.content)
     except: return None
 
-async def process_text_universe(text: str) -> Dict:
+async def process_text_sql(text: str) -> Dict:
     start = time.perf_counter()
-    cache_key = f"universe:{hashlib.md5(text.encode()).hexdigest()}"
+    cache_key = f"sql:{hashlib.md5(text.encode()).hexdigest()}"
     
     if cache_key in l1_cache: return l1_cache[cache_key]
     if redis_client:
@@ -322,7 +322,7 @@ async def process_text_universe(text: str) -> Dict:
 
     draft, research_needs = local_convert(text)
     final_romaji = draft
-    method = "universe_instant"
+    method = "sql_local"
     
     if research_needs and MODELS["deepseek"]["client"]:
         notes, _ = await ResearchEngine.gather_intel(research_needs)
@@ -343,27 +343,21 @@ async def process_text_universe(text: str) -> Dict:
     if redis_client: await redis_client.setex(cache_key, 604800, json.dumps(result))
     return result
 
-# ===== ENDPOINTS =====
-
 @app.get("/convert")
 async def convert(text: str):
     if not text: raise HTTPException(400)
-    return await process_text_universe(text)
+    return await process_text_sql(text)
 
 @app.post("/convert-batch")
 async def convert_batch(lines: List[str]):
-    return await asyncio.gather(*[process_text_universe(l) for l in lines])
+    return await asyncio.gather(*[process_text_sql(l) for l in lines])
 
 @app.post("/force-rebuild")
 async def force_rebuild(secret: str):
     if secret != ADMIN_SECRET: raise HTTPException(403)
-    try:
-        if os.path.exists("titan_dictionary.json"):
-            os.remove("titan_dictionary.json")
-        load_or_build()
-        return {"status": "UNIVERSE REBUILT", "words": len(STATIC_OVERRIDES)}
-    except Exception as e:
-        return {"status": "Error", "detail": str(e)}
+    if os.path.exists(DB_FILE): os.remove(DB_FILE)
+    build_universe_sql()
+    return {"status": "REBUILT_SQL", "words": check_db_status()}
 
 @app.post("/clear-cache")
 async def clear_cache(secret: str):
@@ -375,7 +369,7 @@ async def clear_cache(secret: str):
 
 @app.get("/")
 def root():
-    return {"status": "UNIVERSE_ONLINE", "words_loaded": len(STATIC_OVERRIDES)}
+    return {"status": "SQL_UNIVERSE_ONLINE", "words_in_db": check_db_status()}
 
 if __name__ == "__main__":
     import uvicorn
