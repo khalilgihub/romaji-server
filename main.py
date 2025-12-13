@@ -55,7 +55,7 @@ MODELS_CONFIG = {
         "enabled": bool(GROQ_API_KEY)
     },
     "gemini": {
-        "name": "gemini-1.5-flash",  # Fast & free
+        "name": "gemini-1.5-flash-latest",  # Correct model name
         "provider": "gemini",
         "base_url": None,
         "weight": 1.0,
@@ -207,11 +207,13 @@ def setup_ai_clients():
     if MODELS_CONFIG["gemini"]["enabled"]:
         try:
             genai.configure(api_key=GEMINI_API_KEY)
+            # Use the latest stable model
             gemini_model = genai.GenerativeModel(
-                model_name=MODELS_CONFIG["gemini"]["name"],
+                model_name="gemini-1.5-flash-latest",
                 generation_config={
                     "temperature": 0.05,
                     "top_p": 0.95,
+                    "top_k": 40,
                     "max_output_tokens": 1024,
                 }
             )
@@ -410,24 +412,42 @@ Respond ONLY with valid JSON (no markdown, no code blocks):
     try:
         # Run in executor since Gemini SDK is sync
         loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            executor,
-            lambda: gemini_model.generate_content(prompt)
+        
+        # Generate content with timeout
+        response = await asyncio.wait_for(
+            loop.run_in_executor(
+                executor,
+                lambda: gemini_model.generate_content(
+                    prompt,
+                    generation_config=genai.GenerationConfig(
+                        temperature=0.05,
+                        response_mime_type="application/json"  # Force JSON response
+                    )
+                )
+            ),
+            timeout=10.0  # 10 second timeout
         )
         
-        # Extract JSON from response (Gemini sometimes adds markdown)
+        # Extract JSON from response
         text = response.text.strip()
         
         # Remove markdown code blocks if present
         if "```json" in text:
-            text = re.search(r'```json\s*(.*?)\s*```', text, re.DOTALL).group(1)
+            match = re.search(r'```json\s*(.*?)\s*```', text, re.DOTALL)
+            if match:
+                text = match.group(1)
         elif "```" in text:
-            text = re.search(r'```\s*(.*?)\s*```', text, re.DOTALL).group(1)
+            match = re.search(r'```\s*(.*?)\s*```', text, re.DOTALL)
+            if match:
+                text = match.group(1)
         
         result = json.loads(text)
         result["model"] = "gemini"
-        result["model_name"] = MODELS_CONFIG["gemini"]["name"]
+        result["model_name"] = "gemini-1.5-flash-latest"
         return result
+    except asyncio.TimeoutError:
+        logger.error("❌ Gemini validation timeout")
+        return None
     except Exception as e:
         logger.error(f"❌ Gemini validation failed: {e}")
         return None
@@ -555,15 +575,28 @@ OUTPUT JSON (no markdown):
     if gemini_model:
         try:
             loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(
-                executor,
-                lambda: gemini_model.generate_content(prompt)
+            response = await asyncio.wait_for(
+                loop.run_in_executor(
+                    executor,
+                    lambda: gemini_model.generate_content(
+                        prompt,
+                        generation_config=genai.GenerationConfig(
+                            temperature=0.02,
+                            response_mime_type="application/json"
+                        )
+                    )
+                ),
+                timeout=10.0
             )
             text = response.text.strip()
             if "```json" in text:
-                text = re.search(r'```json\s*(.*?)\s*```', text, re.DOTALL).group(1)
+                match = re.search(r'```json\s*(.*?)\s*```', text, re.DOTALL)
+                if match:
+                    text = match.group(1)
             elif "```" in text:
-                text = re.search(r'```\s*(.*?)\s*```', text, re.DOTALL).group(1)
+                match = re.search(r'```\s*(.*?)\s*```', text, re.DOTALL)
+                if match:
+                    text = match.group(1)
             result = json.loads(text)
             return result
         except Exception as e:
@@ -672,7 +705,7 @@ async def root():
             "details": {
                 "deepseek": f"✅ {MODELS_CONFIG['deepseek']['name']}" if MODELS_CONFIG['deepseek']['enabled'] else "❌ Not configured",
                 "groq": f"✅ {MODELS_CONFIG['llama-groq']['name']} (FREE)" if MODELS_CONFIG['llama-groq']['enabled'] else "❌ Not configured",
-                "gemini": f"✅ {MODELS_CONFIG['gemini']['name']} (FREE)" if MODELS_CONFIG['gemini']['enabled'] else "❌ Not configured"
+                "gemini": f"✅ gemini-1.5-flash-latest (FREE)" if MODELS_CONFIG['gemini']['enabled'] else "❌ Not configured"
             }
         },
         "components": {
@@ -820,7 +853,7 @@ async def test_models():
             result = await validate_with_gemini(test_japanese, test_romaji, [])
             results["gemini"] = {
                 "status": "✅ Working",
-                "model_name": MODELS_CONFIG["gemini"]["name"],
+                "model_name": "gemini-1.5-flash-latest",
                 "response": result
             }
         except Exception as e:
