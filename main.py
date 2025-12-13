@@ -1,11 +1,12 @@
 """
-ULTIMATE ROMAJI ENGINE (v31.0-STATUS-MONITOR)
-"The Transparent Edition"
+ULTIMATE ROMAJI ENGINE (v32.0-GUARDIAN)
+"The Anti-Hallucination Edition"
 
 Features:
-- LIVE STATUS: Check / root to see download progress.
-- 3-LEVEL GLUE: Fixes split words (Kobeya).
-- HYPER-ACCURACY: 880,000 words + Lyric Search + Phonetic Guard.
+- GUARDIAN AI: Sends a "Locked Words" list to the AI to prevent unwanted changes (Fixes Ima->Genzai).
+- DEBUG TOOLS: New /lookup endpoint to check your DB.
+- HYPER GLUE: Enhanced logic to catch 'Kobeya'.
+- UNIVERSE DB: 900,000+ words.
 """
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -32,17 +33,15 @@ from contextlib import asynccontextmanager
 
 # ===== LOGGING =====
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
-logger = logging.getLogger("RomajiStatus")
+logger = logging.getLogger("RomajiGuardian")
 
-# ===== GLOBAL STATUS TRACKER =====
-BUILD_STATUS = "IDLE" # IDLE, DOWNLOADING, PARSING, READY, ERROR
-
+# ===== LIFECYCLE =====
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     asyncio.create_task(background_builder())
     yield
 
-app = FastAPI(title="Romaji Status Monitor", version="31.0.0", lifespan=lifespan)
+app = FastAPI(title="Romaji Guardian", version="32.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware, 
     allow_origins=["*"], 
@@ -57,7 +56,7 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 REDIS_URL = os.environ.get("REDIS_URL")
 ADMIN_SECRET = "admin123"
 DB_FILE = "titan_universe.db"
-DB_VERSION_MARKER = "v31_monitor"
+DB_VERSION_MARKER = "v32_guardian"
 
 MODELS = {
     "deepseek": {
@@ -74,7 +73,8 @@ MODELS = {
     }
 }
 
-# ===== EXPANDED MANUAL PACK (Works while DB builds) =====
+# ===== PRIORITY 1: LYRIC PACK =====
+# Words here are LOCKED. The AI is NOT allowed to change them.
 LYRIC_PACK = {
     "運命": "unmei", "奇跡": "kiseki", "約束": "yakusoku", "記憶": "kioku",
     "物語": "monogatari", "伝説": "densetsu", "永遠": "eien", "瞬間": "shunkan",
@@ -91,8 +91,11 @@ LYRIC_PACK = {
     "私": "watashi", "僕": "boku", "俺": "ore", "君": "kimi", "貴方": "anata",
     "明日": "ashita", "今日": "kyō", "昨日": "kinō", "世界": "sekai",
     "言葉": "kotoba", "心": "kokoro", "愛": "ai", "涙": "namida",
-    "笑顔": "egao", "瞳": "hitomi", "煙草": "tabako", "歌": "uta", 
-    "小部屋": "kobeya", "今": "ima", "確信": "kakushin", "重ねて": "kasanete"
+    "笑顔": "egao", "瞳": "hitomi", 
+    # Fixes from User Feedback
+    "煙草": "tabako", "たばこ": "tabako", "タバコ": "tabako",
+    "小部屋": "kobeya", "歌": "uta", 
+    "今": "ima", "確信": "kakushin", "重ねて": "kasanete"
 }
 
 # ===== BUILDER =====
@@ -108,12 +111,9 @@ def init_db():
     return conn
 
 async def download_and_parse_stream(url, label, converter, conn):
-    global BUILD_STATUS
     try:
         temp_file = f"temp_{label}.gz"
-        BUILD_STATUS = f"DOWNLOADING_{label}"
         logger.info(f"⬇️ {label}: Downloading...")
-        
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as resp:
                 if resp.status == 200:
@@ -124,7 +124,6 @@ async def download_and_parse_stream(url, label, converter, conn):
                             f.write(chunk)
                 else: return
 
-        BUILD_STATUS = f"PARSING_{label}"
         logger.info(f"📦 {label}: Parsing...")
         c = conn.cursor()
         batch = []
@@ -145,12 +144,14 @@ async def download_and_parse_stream(url, label, converter, conn):
                         if any(x in word for x in "▽▼().,"): continue
                         
                         romaji = converter.do(reading).strip()
+                        # Clean Split Logic
                         if ";" in word:
                             for w in word.split(";"):
                                 clean = w.split("(")[0].strip()
                                 if clean: batch.append((clean, romaji))
                         else:
-                            batch.append((word, romaji))
+                            clean = word.split("(")[0].strip()
+                            batch.append((clean, romaji))
                         
                         if len(batch) >= 20000:
                             c.executemany('INSERT OR IGNORE INTO dictionary VALUES (?,?)', batch)
@@ -164,18 +165,11 @@ async def download_and_parse_stream(url, label, converter, conn):
             conn.commit()
         
         if os.path.exists(temp_file): os.remove(temp_file)
-        
-    except Exception as e:
-        BUILD_STATUS = f"ERROR_{label}"
-        logger.error(f"⚠️ {label} Error: {e}")
+        logger.info(f"✅ {label}: Done.")
+    except Exception as e: logger.error(f"⚠️ {label} Error: {e}")
 
 async def background_builder():
-    global BUILD_STATUS
-    if check_db_status() > 50000: 
-        BUILD_STATUS = "READY"
-        return
-
-    BUILD_STATUS = "STARTING"
+    if check_db_status() > 50000: return
     logger.info("🚀 BUILDER STARTED")
     import pykakasi
     k = pykakasi.kakasi()
@@ -195,7 +189,6 @@ async def background_builder():
     c.execute("INSERT OR REPLACE INTO meta VALUES ('version', ?)", (DB_VERSION_MARKER,))
     conn.commit()
     conn.close()
-    BUILD_STATUS = "READY"
     logger.info("🎉 BUILD COMPLETE")
 
 def check_db_status():
@@ -279,16 +272,14 @@ class LyricSearchEngine:
         except: return None
         return None
 
-def is_phonetically_similar(a, b):
-    if not a or not b: return False
-    return SequenceMatcher(None, a, b).ratio() > 0.3
+# ===== GLUE & LOCKING =====
 
-# ===== GLUE & CONVERT =====
-
-def local_convert(text: str) -> Tuple[str, List[str]]:
-    if not tagger or not kakasi_conv: return text, []
+def local_convert(text: str) -> Tuple[str, List[str], Dict[str, str]]:
+    if not tagger or not kakasi_conv: return text, [], {}
     romaji_parts = []
     research_targets = []
+    locked_words = {} # Words that MUST NOT be changed by AI
+    
     text = text.replace("　", " ")
     nodes = list(tagger(text))
     i = 0
@@ -301,22 +292,28 @@ def local_convert(text: str) -> Tuple[str, List[str]]:
         if i + 2 < len(nodes):
             tri_combo = word + nodes[i+1].surface + nodes[i+2].surface
             if tri_combo in LYRIC_PACK:
-                romaji_parts.append(LYRIC_PACK[tri_combo])
+                r = LYRIC_PACK[tri_combo]
+                romaji_parts.append(r)
+                locked_words[tri_combo] = r
                 i += 3; continue
             db_hit = get_static_romaji(tri_combo)
             if db_hit:
                 romaji_parts.append(db_hit)
+                locked_words[tri_combo] = db_hit
                 i += 3; continue
 
         # 2-LEVEL GLUE
         if i + 1 < len(nodes):
             duo_combo = word + nodes[i+1].surface
             if duo_combo in LYRIC_PACK:
-                romaji_parts.append(LYRIC_PACK[duo_combo])
+                r = LYRIC_PACK[duo_combo]
+                romaji_parts.append(r)
+                locked_words[duo_combo] = r
                 i += 2; continue
             db_hit = get_static_romaji(duo_combo)
             if db_hit:
                 romaji_parts.append(db_hit)
+                locked_words[duo_combo] = db_hit
                 i += 2; continue
 
         # PARTICLES
@@ -329,7 +326,9 @@ def local_convert(text: str) -> Tuple[str, List[str]]:
             
         # LYRIC PACK
         if word in LYRIC_PACK:
-            romaji_parts.append(LYRIC_PACK[word])
+            r = LYRIC_PACK[word]
+            romaji_parts.append(r)
+            locked_words[word] = r
             i += 1; continue
 
         # DATABASE
@@ -338,13 +337,18 @@ def local_convert(text: str) -> Tuple[str, List[str]]:
         mecab_romaji = kakasi_conv.do(mecab_raw).strip()
         
         if db_romaji:
+            # Phonetic Guard
             if len(word) == 1:
-                if not is_phonetically_similar(db_romaji, mecab_romaji):
-                    romaji_parts.append(mecab_romaji) 
+                # If DB is wild (Genzai vs Ima), trust MeCab BUT lock it so AI doesn't hallucinate
+                if SequenceMatcher(None, db_romaji, mecab_romaji).ratio() < 0.3:
+                    romaji_parts.append(mecab_romaji)
+                    locked_words[word] = mecab_romaji
                 else:
                     romaji_parts.append(db_romaji)
+                    locked_words[word] = db_romaji
             else:
                 romaji_parts.append(db_romaji)
+                locked_words[word] = db_romaji
         else:
             romaji_parts.append(mecab_romaji)
 
@@ -353,7 +357,7 @@ def local_convert(text: str) -> Tuple[str, List[str]]:
         i += 1
 
     draft = re.sub(r'\s+', ' ', " ".join(romaji_parts)).strip()
-    return draft, list(set(research_targets))
+    return draft, list(set(research_targets)), locked_words
 
 async def call_ai(client, model_id, prompt):
     try:
@@ -364,30 +368,44 @@ async def call_ai(client, model_id, prompt):
         return json.loads(resp.choices[0].message.content)
     except: return None
 
-async def process_text_status(text: str) -> Dict:
+async def process_text_guardian(text: str) -> Dict:
     start = time.perf_counter()
-    cache_key = f"stat_v31:{hashlib.md5(text.encode()).hexdigest()}"
+    cache_key = f"guardian_v32:{hashlib.md5(text.encode()).hexdigest()}"
     
     if cache_key in l1_cache: return l1_cache[cache_key]
     if redis_client:
         cached = await redis_client.get(cache_key)
         if cached: return json.loads(cached)
 
-    draft, research_needs = local_convert(text)
+    draft, research_needs, locked = local_convert(text)
     final_romaji = draft
     method = "local_db"
     official_match = False
     
+    # 1. SEARCH
     async with aiohttp.ClientSession() as session:
         official = await LyricSearchEngine.find_official_line(session, text)
         if official:
-            draft_off, _ = local_convert(official)
+            draft_off, _, _ = local_convert(official)
             final_romaji = draft_off
             method = "official_match"
             official_match = True
     
+    # 2. AI REFINEMENT (WITH GUARDIAN LOCK)
     if (research_needs and not official_match) and MODELS["deepseek"]["client"]:
-        prompt = f"Task: Fix Romaji.\nJP: {text}\nDraft: {draft}\nAttention: {', '.join(research_needs)}\nRules: wa/wo/e particles.\nJSON: {{'corrected': 'string'}}"
+        # Guardian Logic: Construct a "Do Not Change" list for the AI
+        lock_instructions = ", ".join([f"{k}={v}" for k,v in locked.items() if len(k) < 4])
+        
+        prompt = f"""Task: Fix Romaji.
+JP: {text}
+DRAFT: {draft}
+LOCKED (DO NOT CHANGE): {lock_instructions}
+RULES: 
+1. Fix ONLY grammar/particles. 
+2. Respect LOCKED words.
+3. 'ima' not 'genzai'.
+JSON: {{'corrected': 'string'}}"""
+        
         data = await call_ai(MODELS["deepseek"]["client"], MODELS["deepseek"]["id"], prompt)
         if data:
             final_romaji = data.get("corrected", draft)
@@ -397,8 +415,6 @@ async def process_text_status(text: str) -> Dict:
         "original": text,
         "romaji": re.sub(r'\s+', ' ', final_romaji).strip(),
         "method": method,
-        "sys_status": BUILD_STATUS,
-        "trace": f"DB:{check_db_status()}",
         "time": round(time.perf_counter()-start, 4)
     }
     
@@ -409,18 +425,18 @@ async def process_text_status(text: str) -> Dict:
 @app.get("/convert")
 async def convert(text: str):
     if not text: raise HTTPException(400)
-    return await process_text_status(text)
+    return await process_text_guardian(text)
 
 @app.post("/convert-batch")
 async def convert_batch(lines: List[str]):
-    return await asyncio.gather(*[process_text_status(l) for l in lines])
+    return await asyncio.gather(*[process_text_guardian(l) for l in lines])
 
 @app.post("/force-rebuild")
 async def force_rebuild(secret: str):
     if secret != ADMIN_SECRET: raise HTTPException(403)
     if os.path.exists(DB_FILE): os.remove(DB_FILE)
     asyncio.create_task(background_builder())
-    return {"status": "Rebuild Triggered"}
+    return {"status": "Background Rebuild Started"}
 
 @app.post("/clear-cache")
 async def clear_cache(secret: str):
@@ -430,9 +446,18 @@ async def clear_cache(secret: str):
     if redis_client: await redis_client.flushdb()
     return {"status": "Cache Cleared"}
 
+# NEW DEBUG ENDPOINT
+@app.get("/lookup")
+def lookup(word: str):
+    return {
+        "word": word,
+        "db_romaji": get_static_romaji(word),
+        "manual_romaji": LYRIC_PACK.get(word)
+    }
+
 @app.get("/")
 def root():
-    return {"status": BUILD_STATUS, "db_words": check_db_status()}
+    return {"status": "GUARDIAN_ONLINE", "db_size": check_db_status()}
 
 if __name__ == "__main__":
     import uvicorn
