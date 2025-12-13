@@ -524,7 +524,7 @@ def local_convert(text: str) -> Tuple[str, List[str], Dict[str, str]]:
             i += 1
             continue
             
-        # LYRIC PACK (individual words)
+        # LYRIC PACK (individual words) - CHECK THIS FIRST BEFORE DB
         if word in LYRIC_PACK:
             r = LYRIC_PACK[word]
             romaji_parts.append(r)
@@ -539,7 +539,13 @@ def local_convert(text: str) -> Tuple[str, List[str], Dict[str, str]]:
         mecab_raw = node.feature[7] if len(node.feature) > 7 and node.feature[7] != '*' else word
         mecab_romaji = kakasi_conv.do(mecab_raw).strip()
         
-        if db_romaji:
+        # If DB has spaces in the romaji (like "wa tashi"), it's probably wrong - use MeCab
+        if db_romaji and ' ' in db_romaji:
+            romaji_parts.append(mecab_romaji)
+            particle_positions.append(False)
+            locked_words[word] = mecab_romaji
+            logger.debug(f"🔒 DB had spaces, using MeCab: {word} -> {mecab_romaji}")
+        elif db_romaji:
             # Phonetic Guard: For single chars, check if DB is wildly different
             if len(word) == 1:
                 similarity = SequenceMatcher(None, db_romaji, mecab_romaji).ratio()
@@ -850,6 +856,31 @@ async def convert_batch(lines: List[str]):
     """Convert multiple lines in parallel"""
     return await asyncio.gather(*[process_text_guardian(l) for l in lines])
 
+@app.get("/check-db")
+def check_db_words():
+    """Check what's in DB for problem words"""
+    problem_words = [
+        "小部屋", "私", "学生", "名前", "約束", "感謝", 
+        "今日", "明日", "人", "煙草", "晴れ", "無理"
+    ]
+    
+    results = {}
+    for word in problem_words:
+        db_result = get_static_romaji(word)
+        results[word] = {
+            "db_romaji": db_result,
+            "has_spaces": ' ' in db_result if db_result else False,
+            "in_compound_priority": word in COMPOUND_PRIORITY,
+            "compound_value": COMPOUND_PRIORITY.get(word),
+            "in_lyric_pack": word in LYRIC_PACK,
+            "lyric_value": LYRIC_PACK.get(word)
+        }
+    
+    return {
+        "problem_words": results,
+        "recommendation": "Words with spaces in DB should be overridden by COMPOUND_PRIORITY"
+    }
+
 @app.get("/lookup")
 def lookup(word: str):
     """Debug: Look up a word in database and manual dict"""
@@ -866,31 +897,41 @@ def lookup(word: str):
 async def debug_convert(text: str):
     """Debug: Show detailed conversion steps"""
     try:
-        draft, research_needs, locked = local_convert(text)
+        if not tagger:
+            return {"error": "Tagger not available", "input": text}
+            
+        # Tokenize
+        tokens = []
+        try:
+            nodes = list(tagger(text))
+            for node in nodes:
+                word = node.surface
+                tokens.append({
+                    "word": word,
+                    "pos": node.feature[0] if len(node.feature) > 0 else "?",
+                    "reading": node.feature[7] if len(node.feature) > 7 and node.feature[7] != '*' else word,
+                    "in_compound_priority": word in COMPOUND_PRIORITY,
+                    "in_lyric_pack": word in LYRIC_PACK,
+                    "db_romaji": get_static_romaji(word)
+                })
+        except Exception as e:
+            return {"error": f"Tokenization error: {e}", "input": text}
         
-        token_count = 0
-        if tagger:
-            try:
-                token_count = len(list(tagger(text)))
-            except:
-                token_count = 0
+        # Get conversion
+        draft, research_needs, locked = local_convert(text)
         
         return {
             "input": text,
+            "tokens": tokens,
             "draft_romaji": draft,
             "locked_words": locked,
             "research_needed": research_needs,
-            "locked_count": len(locked),
-            "steps": {
-                "1_tokenization": f"{token_count} tokens" if token_count > 0 else "N/A",
-                "2_glue_logic": "Compound Priority → 3-Level → 2-Level → Particles → Individual",
-                "3_locking": f"{len(locked)} words locked",
-                "4_spacing": "Applied fix_spacing()"
-            }
+            "locked_count": len(locked)
         }
     except Exception as e:
         logger.error(f"Debug error: {e}")
-        return {"error": str(e), "input": text}
+        import traceback
+        return {"error": str(e), "traceback": traceback.format_exc(), "input": text}
 
 @app.post("/force-rebuild")
 async def force_rebuild(secret: str):
