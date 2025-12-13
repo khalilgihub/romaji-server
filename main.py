@@ -1,12 +1,13 @@
 """
-ULTIMATE ROMAJI ENGINE (v26.0-LYRIC-SEARCH)
-"The Fact-Checker Edition"
+ULTIMATE ROMAJI ENGINE (v27.0-HYPER-SCAN)
+"The Compound Word Fixer"
 
-Features:
-- LYRIC SEARCH: Scrapes J-Lyric.net to find the OFFICIAL song/lyrics.
-- AUTO-CORRECTION: Replaces user's typos/kana with Official Kanji from the database.
-- SENTINEL AI: Handles context.
-- UNIVERSE DB: 880,000+ words backup.
+Fixes:
+- GLUE LOGIC: Detects when MeCab wrongly splits words (e.g. 'Sho'+'Heya') 
+  and glues them back together ('Kobeya') using the DB.
+- LYRIC SEARCH: Finds official lyrics to fix typos.
+- UNIVERSE DB: 880,000+ words.
+- ACCURACY: Fixes "Ensou" -> "Tabako" and "Shoheya" -> "Kobeya".
 """
 
 from fastapi import FastAPI, HTTPException
@@ -32,9 +33,9 @@ from difflib import SequenceMatcher
 
 # ===== LOGGING & SETUP =====
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
-logger = logging.getLogger("RomajiLyricSearch")
+logger = logging.getLogger("RomajiHyperScan")
 
-app = FastAPI(title="Romaji Lyric Search", version="26.0.0")
+app = FastAPI(title="Romaji Hyper-Scan", version="27.0.0")
 app.add_middleware(
     CORSMiddleware, 
     allow_origins=["*"], 
@@ -49,7 +50,7 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 REDIS_URL = os.environ.get("REDIS_URL")
 ADMIN_SECRET = "admin123"
 DB_FILE = "titan_universe.db"
-DB_VERSION_MARKER = "v26_lyric"
+DB_VERSION_MARKER = "v27_scan"
 
 MODELS = {
     "deepseek": {
@@ -65,68 +66,6 @@ MODELS = {
         "key": GROQ_API_KEY
     }
 }
-
-# ===== SEARCH ENGINE (J-LYRIC) =====
-class LyricSearchEngine:
-    BASE_URL = "http://search.j-lyric.net/index.php"
-    
-    @staticmethod
-    async def find_official_line(session: aiohttp.ClientSession, user_text: str) -> Optional[str]:
-        """
-        Searches J-Lyric for the user's line. 
-        Returns the OFFICIAL line from the database if found.
-        """
-        # Clean text for search (remove punctuation)
-        clean_q = re.sub(r"[!?.、。]", " ", user_text).strip()
-        if len(clean_q) < 4: return None # Too short to search unique song
-        
-        params = {"kt": clean_q, "ct": 2, "ka": "", "ca": 2, "kl": "", "cl": 2}
-        try:
-            async with session.get(LyricSearchEngine.BASE_URL, params=params, timeout=3.0) as resp:
-                if resp.status != 200: return None
-                html = await resp.text()
-                
-                # Parse Search Results
-                soup = BeautifulSoup(html, 'html.parser')
-                # Find first song link
-                body = soup.find('div', id='mnb')
-                if not body: return None
-                
-                first_result = body.find('p', class_='mid')
-                if not first_result: return None
-                
-                link = first_result.find('a')
-                if not link: return None
-                
-                song_url = link['href']
-                
-                # Fetch Song Lyrics
-                async with session.get(song_url, timeout=3.0) as song_resp:
-                    if song_resp.status != 200: return None
-                    song_html = await song_resp.text()
-                    song_soup = BeautifulSoup(song_html, 'html.parser')
-                    lyric_div = song_soup.find('p', id='Lyric')
-                    
-                    if lyric_div:
-                        full_lyrics = lyric_div.get_text(separator="\n").split("\n")
-                        # Find the line that matches best
-                        best_match = None
-                        highest_ratio = 0.0
-                        
-                        for line in full_lyrics:
-                            ratio = SequenceMatcher(None, user_text, line).ratio()
-                            if ratio > highest_ratio:
-                                highest_ratio = ratio
-                                best_match = line
-                        
-                        # Only return if it's a strong match (>60%)
-                        if highest_ratio > 0.6:
-                            return best_match
-                            
-        except Exception as e:
-            logger.warning(f"Lyric Search Failed: {e}")
-            return None
-        return None
 
 # ===== PRIORITY 1: LYRIC PACK =====
 LYRIC_PACK = {
@@ -145,10 +84,12 @@ LYRIC_PACK = {
     "貴方": "anata", "明日": "ashita", "今日": "kyō", "昨日": "kinō", 
     "世界": "sekai", "言葉": "kotoba", "心": "kokoro", "愛": "ai", 
     "涙": "namida", "笑顔": "egao", "瞳": "hitomi",
-    "煙草": "tabako", "歌": "uta"
+    # Specific User Fixes
+    "煙草": "tabako", "たばこ": "tabako", "タバコ": "tabako",
+    "小部屋": "kobeya", "歌": "uta"
 }
 
-# ===== DATABASE BUILDER =====
+# ===== DB BUILDER =====
 EDICT_URL = "http://ftp.edrdg.org/pub/Nihongo/edict.gz"
 ENAMDICT_URL = "http://ftp.edrdg.org/pub/Nihongo/enamdict.gz"
 
@@ -278,44 +219,97 @@ def init_globals():
 
 init_globals()
 
-# ===== CONVERSION LOGIC (LYRIC SEARCH) =====
+# ===== SEARCH ENGINE =====
+class LyricSearchEngine:
+    BASE_URL = "http://search.j-lyric.net/index.php"
+    @staticmethod
+    async def find_official_line(session, user_text):
+        clean_q = re.sub(r"[!?.、。]", " ", user_text).strip()
+        if len(clean_q) < 4: return None
+        params = {"kt": clean_q, "ct": 2, "ka": "", "ca": 2, "kl": "", "cl": 2}
+        try:
+            async with session.get(LyricSearchEngine.BASE_URL, params=params, timeout=3.0) as resp:
+                if resp.status != 200: return None
+                soup = BeautifulSoup(await resp.text(), 'html.parser')
+                body = soup.find('div', id='mnb')
+                if not body: return None
+                link = body.find('p', class_='mid').find('a')
+                if not link: return None
+                
+                async with session.get(link['href'], timeout=3.0) as song_resp:
+                    song_soup = BeautifulSoup(await song_resp.text(), 'html.parser')
+                    lyric_div = song_soup.find('p', id='Lyric')
+                    if lyric_div:
+                        for line in lyric_div.get_text(separator="\n").split("\n"):
+                            if SequenceMatcher(None, user_text, line).ratio() > 0.6:
+                                return line
+        except: return None
+        return None
+
+# ===== CONVERSION LOGIC (GLUE FIX) =====
 
 def local_convert(text: str) -> Tuple[str, List[str]]:
     if not tagger or not kakasi_conv: return text, []
-    romaji_parts, research_targets = [], []
-    text = text.replace("　", " ")
+    romaji_parts = []
+    research_targets = []
     
-    for node in tagger(text):
+    # Pre-clean
+    text = text.replace("　", " ")
+    nodes = list(tagger(text))
+    
+    i = 0
+    while i < len(nodes):
+        node = nodes[i]
         word = node.surface
-        if not word: continue
         
-        # 1. GRAMMAR PRIORITY
+        # --- GLUE LOGIC START ---
+        # Check if current node + next node forms a valid word in DB
+        # This fixes 'Sho'+'Heya' -> 'Kobeya' and 'En'+'Sou' -> 'Tabako'
+        if i + 1 < len(nodes):
+            next_node = nodes[i+1]
+            combined = word + next_node.surface
+            
+            # 1. Check Lyric Pack for Combo
+            if combined in LYRIC_PACK:
+                romaji_parts.append(LYRIC_PACK[combined])
+                i += 2 # Skip next node
+                continue
+                
+            # 2. Check DB for Combo
+            db_hit = get_static_romaji(combined)
+            if db_hit:
+                romaji_parts.append(db_hit)
+                i += 2 # Skip next node
+                continue
+        # --- GLUE LOGIC END ---
+
+        # Standard Processing
         if node.feature[0] == '助詞':
             if word == 'は': romaji_parts.append('wa')
             elif word == 'へ': romaji_parts.append('e')
             elif word == 'を': romaji_parts.append('wo')
             else: romaji_parts.append(kakasi_conv.do(word))
+            i += 1
             continue
             
-        # 2. LYRIC PACK
         if word in LYRIC_PACK:
             romaji_parts.append(LYRIC_PACK[word])
+            i += 1
             continue
 
-        # 3. UNIVERSE DB
         db_hit = get_static_romaji(word)
         if db_hit:
             romaji_parts.append(db_hit)
+            i += 1
             continue
             
-        # 4. FALLBACK
         reading = node.feature[7] if len(node.feature) > 7 and node.feature[7] != '*' else None
         roma = kakasi_conv.do(reading) if reading else kakasi_conv.do(word)
         romaji_parts.append(roma)
 
-        # 5. RESEARCH NEEDED
         if any('\u4e00' <= c <= '\u9fff' for c in word):
             research_targets.append(word)
+        i += 1
 
     draft = re.sub(r'\s+', ' ', " ".join(romaji_parts)).strip()
     return draft, list(set(research_targets))
@@ -329,9 +323,9 @@ async def call_ai(client, model_id, prompt):
         return json.loads(resp.choices[0].message.content)
     except: return None
 
-async def process_text_search(text: str) -> Dict:
+async def process_text_scan(text: str) -> Dict:
     start = time.perf_counter()
-    cache_key = f"lyric:{hashlib.md5(text.encode()).hexdigest()}"
+    cache_key = f"scan:{hashlib.md5(text.encode()).hexdigest()}"
     
     if cache_key in l1_cache: return l1_cache[cache_key]
     if redis_client:
@@ -343,27 +337,18 @@ async def process_text_search(text: str) -> Dict:
     method = "local_db"
     official_match = False
     
-    # 1. TRY LYRIC SEARCH (The "Oracle")
+    # 1. J-LYRIC SEARCH
     async with aiohttp.ClientSession() as session:
-        official_line = await LyricSearchEngine.find_official_line(session, text)
-        
-        if official_line:
-            # If we found the official line, use THAT for conversion instead
-            # This fixes typos or wrong kanji in user input
-            draft_official, _ = local_convert(official_line)
-            final_romaji = draft_official
-            method = "official_lyric_match"
+        official = await LyricSearchEngine.find_official_line(session, text)
+        if official:
+            draft_off, _ = local_convert(official)
+            final_romaji = draft_off
+            method = "official_match"
             official_match = True
     
-    # 2. AI REFINEMENT (If no official match OR complex words exist)
+    # 2. AI REFINEMENT
     if (research_needs and not official_match) and MODELS["deepseek"]["client"]:
-        prompt = f"""Task: Fix Romaji.
-JP: {text}
-DRAFT: {draft}
-ATTENTION: {', '.join(research_needs)}
-Rules: wa/wo/e particles.
-JSON: {{'corrected': 'string'}}"""
-        
+        prompt = f"Task: Fix Romaji.\nJP: {text}\nDraft: {draft}\nAttention: {', '.join(research_needs)}\nRules: wa/wo/e particles.\nJSON: {{'corrected': 'string'}}"
         data = await call_ai(MODELS["deepseek"]["client"], MODELS["deepseek"]["id"], prompt)
         if data:
             final_romaji = data.get("corrected", draft)
@@ -373,7 +358,7 @@ JSON: {{'corrected': 'string'}}"""
         "original": text,
         "romaji": re.sub(r'\s+', ' ', final_romaji).strip(),
         "method": method,
-        "official_match_found": official_match,
+        "official_match": official_match,
         "time": round(time.perf_counter()-start, 4)
     }
     
@@ -384,11 +369,11 @@ JSON: {{'corrected': 'string'}}"""
 @app.get("/convert")
 async def convert(text: str):
     if not text: raise HTTPException(400)
-    return await process_text_search(text)
+    return await process_text_scan(text)
 
 @app.post("/convert-batch")
 async def convert_batch(lines: List[str]):
-    return await asyncio.gather(*[process_text_search(l) for l in lines])
+    return await asyncio.gather(*[process_text_scan(l) for l in lines])
 
 @app.post("/force-rebuild")
 async def force_rebuild(secret: str):
@@ -407,7 +392,7 @@ async def clear_cache(secret: str):
 
 @app.get("/")
 def root():
-    return {"status": "LYRIC_SEARCH_ONLINE", "db_size": check_db_status()}
+    return {"status": "HYPER_SCAN_ONLINE", "db_size": check_db_status()}
 
 if __name__ == "__main__":
     import uvicorn
