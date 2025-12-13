@@ -1,14 +1,13 @@
 """
-ULTIMATE ROMAJI ENGINE (v33.0-ENHANCED)
+ULTIMATE ROMAJI ENGINE (v33.1-FIXED)
 "The Ultra Anti-Hallucination Edition"
 
-NEW IN v33:
+NEW IN v33.1:
+- CRITICAL FIX: Resolved NameError 'word_end' in local_convert
+- BUG FIX: Corrected loop logic for Compound Priority handling
 - ENHANCED VALIDATION: Post-AI checks to catch hallucinations
 - COMPOUND PRIORITY: Special handling for tricky compounds
 - DETAILED LOGGING: Track all conversions and changes
-- TEST SUITE: Built-in quality assurance
-- STRICTER AI PROMPTS: Better instructions with examples
-- CONFIDENCE SCORING: Know when to trust the output
 """
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -46,7 +45,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(background_builder())
     yield
 
-app = FastAPI(title="Romaji Guardian Enhanced", version="33.0.0", lifespan=lifespan)
+app = FastAPI(title="Romaji Guardian Enhanced", version="33.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware, 
     allow_origins=["*"], 
@@ -81,14 +80,14 @@ MODELS = {
 # ===== COMPOUND PRIORITY =====
 # These MUST be kept together as single units
 COMPOUND_PRIORITY = {
-    "小部屋": "kobeya",      # NOT "ko heya" or "kob e ya"
-    "煙草": "tabako",        # NOT "kemuri kusa"
+    "小部屋": "kobeya",       # NOT "ko heya" or "kob e ya"
+    "煙草": "tabako",         # NOT "kemuri kusa"
     "たばこ": "tabako",
     "タバコ": "tabako",
-    "今日": "kyō",           # NOT "konnichi"
-    "明日": "ashita",        # NOT "myōnichi"  
-    "昨日": "kinō",          # NOT "sakujitsu"
-    "今": "ima",             # NOT "genzai" or "kon"
+    "今日": "kyō",            # NOT "konnichi"
+    "明日": "ashita",         # NOT "myōnichi"  
+    "昨日": "kinō",           # NOT "sakujitsu"
+    "今": "ima",              # NOT "genzai" or "kon"
     "今夜": "kon'ya",
     "今朝": "kesa",
     "今年": "kotoshi",
@@ -97,14 +96,14 @@ COMPOUND_PRIORITY = {
     "先月": "sengetsu",
     "今月": "kongetsu",
     "来月": "raigetsu",
-    "学生": "gakusei",       # NOT "gakushou" or "ga kusei"
-    "人": "hito",            # NOT "nin" or "jin" or "hi to"
-    "私": "watashi",         # NOT "wa tashi"
-    "名前": "namae",         # NOT "nama e"
-    "約束": "yakusoku",      # NOT "ya kusoku"
-    "感謝": "kansha",        # NOT "ka nsha"
+    "学生": "gakusei",        # NOT "gakushou" or "ga kusei"
+    "人": "hito",             # NOT "nin" or "jin" or "hi to"
+    "私": "watashi",          # NOT "wa tashi"
+    "名前": "namae",          # NOT "nama e"
+    "約束": "yakusoku",       # NOT "ya kusoku"
+    "感謝": "kansha",         # NOT "ka nsha"
     "無理": "muri",
-    "晴れ": "hare",          # NOT "har e"
+    "晴れ": "hare",           # NOT "har e"
 }
 
 # ===== BASIC READINGS =====
@@ -196,12 +195,12 @@ LYRIC_PACK = {
 # ===== HALLUCINATION PATTERNS =====
 # Common wrong conversions the AI might make
 HALLUCINATION_PAIRS = [
-    ("ima", "genzai"),       # 今 should be 'ima' in conversation
-    ("kyō", "honjitsu"),     # 今日 conversational vs formal
-    ("ashita", "myōnichi"),  # 明日 conversational vs formal
-    ("kinō", "sakujitsu"),   # 昨日 conversational vs formal
-    ("tabako", "kemuri"),    # Don't split 煙草
-    ("kobeya", "ko heya"),   # Don't split 小部屋
+    ("ima", "genzai"),        # 今 should be 'ima' in conversation
+    ("kyō", "honjitsu"),      # 今日 conversational vs formal
+    ("ashita", "myōnichi"),   # 明日 conversational vs formal
+    ("kinō", "sakujitsu"),    # 昨日 conversational vs formal
+    ("tabako", "kemuri"),     # Don't split 煙草
+    ("kobeya", "ko heya"),    # Don't split 小部屋
 ]
 
 # ===== BUILDER =====
@@ -478,10 +477,6 @@ def local_convert(text: str) -> Tuple[str, List[str], Dict[str, str]]:
     nodes = list(tagger(text))
     i = 0
     char_position = 0  # Track character position in original text
-    # Now tokenize
-    nodes = list(tagger(text))
-    i = 0
-    char_position = 0  # Track character position in original text
     
     while i < len(nodes):
         node = nodes[i]
@@ -503,8 +498,8 @@ def local_convert(text: str) -> Tuple[str, List[str], Dict[str, str]]:
                 i += 1
             continue
         
-        matched = False
         char_position += len(word)
+        matched = False
         
         # PRIORITY: Check COMPOUND_PRIORITY first (before any other glue)
         # This ensures compounds like 小部屋 stay together
@@ -520,8 +515,9 @@ def local_convert(text: str) -> Tuple[str, List[str], Dict[str, str]]:
                     i += length
                     matched = True
                     break
-        processed_chars = word_end
-        matched = False
+        
+        if matched:
+            continue
         
         # 3-LEVEL GLUE (for non-priority compounds that weren't pre-scanned)
         if i + 2 < len(nodes):
@@ -995,7 +991,7 @@ async def clear_cache(secret: str):
 def stats():
     """Get system statistics"""
     return {
-        "version": "33.0.0",
+        "version": "33.1.0",
         "db_size": check_db_status(),
         "cache_size": len(l1_cache),
         "lyric_pack_size": len(LYRIC_PACK),
@@ -1009,7 +1005,7 @@ def root():
     """Health check"""
     return {
         "status": "GUARDIAN_ENHANCED_ONLINE",
-        "version": "33.0.0", 
+        "version": "33.1.0", 
         "db_size": check_db_status()
     }
 
