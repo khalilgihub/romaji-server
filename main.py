@@ -1,11 +1,11 @@
 """
-ULTIMATE ROMAJI ENGINE (v30.0-HYPER-GLUE)
-"The Multi-Part Fixer"
+ULTIMATE ROMAJI ENGINE (v31.0-STATUS-MONITOR)
+"The Transparent Edition"
 
-Fixes:
-- 3-LEVEL GLUE: Stitches words split into 3 parts (e.g. Ko+Be+Ya).
-- USER-AGENT: Prevents Lyric Search from getting blocked.
-- DEBUG TRACE: Tells you exactly which method was used for each line.
+Features:
+- LIVE STATUS: Check / root to see download progress.
+- 3-LEVEL GLUE: Fixes split words (Kobeya).
+- HYPER-ACCURACY: 880,000 words + Lyric Search + Phonetic Guard.
 """
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -32,15 +32,17 @@ from contextlib import asynccontextmanager
 
 # ===== LOGGING =====
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
-logger = logging.getLogger("RomajiHyperGlue")
+logger = logging.getLogger("RomajiStatus")
 
-# ===== LIFECYCLE =====
+# ===== GLOBAL STATUS TRACKER =====
+BUILD_STATUS = "IDLE" # IDLE, DOWNLOADING, PARSING, READY, ERROR
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     asyncio.create_task(background_builder())
     yield
 
-app = FastAPI(title="Romaji Hyper-Glue", version="30.0.0", lifespan=lifespan)
+app = FastAPI(title="Romaji Status Monitor", version="31.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware, 
     allow_origins=["*"], 
@@ -55,7 +57,7 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 REDIS_URL = os.environ.get("REDIS_URL")
 ADMIN_SECRET = "admin123"
 DB_FILE = "titan_universe.db"
-DB_VERSION_MARKER = "v30_glue"
+DB_VERSION_MARKER = "v31_monitor"
 
 MODELS = {
     "deepseek": {
@@ -72,7 +74,7 @@ MODELS = {
     }
 }
 
-# ===== MANUAL OVERRIDES =====
+# ===== EXPANDED MANUAL PACK (Works while DB builds) =====
 LYRIC_PACK = {
     "運命": "unmei", "奇跡": "kiseki", "約束": "yakusoku", "記憶": "kioku",
     "物語": "monogatari", "伝説": "densetsu", "永遠": "eien", "瞬間": "shunkan",
@@ -90,7 +92,7 @@ LYRIC_PACK = {
     "明日": "ashita", "今日": "kyō", "昨日": "kinō", "世界": "sekai",
     "言葉": "kotoba", "心": "kokoro", "愛": "ai", "涙": "namida",
     "笑顔": "egao", "瞳": "hitomi", "煙草": "tabako", "歌": "uta", 
-    "小部屋": "kobeya", "今": "ima"
+    "小部屋": "kobeya", "今": "ima", "確信": "kakushin", "重ねて": "kasanete"
 }
 
 # ===== BUILDER =====
@@ -106,9 +108,12 @@ def init_db():
     return conn
 
 async def download_and_parse_stream(url, label, converter, conn):
+    global BUILD_STATUS
     try:
         temp_file = f"temp_{label}.gz"
+        BUILD_STATUS = f"DOWNLOADING_{label}"
         logger.info(f"⬇️ {label}: Downloading...")
+        
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as resp:
                 if resp.status == 200:
@@ -119,6 +124,7 @@ async def download_and_parse_stream(url, label, converter, conn):
                             f.write(chunk)
                 else: return
 
+        BUILD_STATUS = f"PARSING_{label}"
         logger.info(f"📦 {label}: Parsing...")
         c = conn.cursor()
         batch = []
@@ -158,13 +164,18 @@ async def download_and_parse_stream(url, label, converter, conn):
             conn.commit()
         
         if os.path.exists(temp_file): os.remove(temp_file)
-        logger.info(f"✅ {label}: Done.")
         
     except Exception as e:
+        BUILD_STATUS = f"ERROR_{label}"
         logger.error(f"⚠️ {label} Error: {e}")
 
 async def background_builder():
-    if check_db_status() > 50000: return
+    global BUILD_STATUS
+    if check_db_status() > 50000: 
+        BUILD_STATUS = "READY"
+        return
+
+    BUILD_STATUS = "STARTING"
     logger.info("🚀 BUILDER STARTED")
     import pykakasi
     k = pykakasi.kakasi()
@@ -184,6 +195,7 @@ async def background_builder():
     c.execute("INSERT OR REPLACE INTO meta VALUES ('version', ?)", (DB_VERSION_MARKER,))
     conn.commit()
     conn.close()
+    BUILD_STATUS = "READY"
     logger.info("🎉 BUILD COMPLETE")
 
 def check_db_status():
@@ -240,7 +252,7 @@ def init_globals():
 
 init_globals()
 
-# ===== LYRIC SEARCH =====
+# ===== SEARCH =====
 class LyricSearchEngine:
     BASE_URL = "http://search.j-lyric.net/index.php"
     @staticmethod
@@ -257,7 +269,6 @@ class LyricSearchEngine:
                 if not body: return None
                 link = body.find('p', class_='mid').find('a')
                 if not link: return None
-                
                 async with session.get(link['href'], headers=headers, timeout=4.0) as song_resp:
                     song_soup = BeautifulSoup(await song_resp.text(), 'html.parser')
                     lyric_div = song_soup.find('p', id='Lyric')
@@ -272,7 +283,7 @@ def is_phonetically_similar(a, b):
     if not a or not b: return False
     return SequenceMatcher(None, a, b).ratio() > 0.3
 
-# ===== CONVERSION (HYPER GLUE) =====
+# ===== GLUE & CONVERT =====
 
 def local_convert(text: str) -> Tuple[str, List[str]]:
     if not tagger or not kakasi_conv: return text, []
@@ -286,8 +297,7 @@ def local_convert(text: str) -> Tuple[str, List[str]]:
         node = nodes[i]
         word = node.surface
         
-        # --- 3-LEVEL GLUE LOGIC ---
-        # Try gluing 3 parts: A + B + C (e.g., Ko+Be+Ya)
+        # 3-LEVEL GLUE
         if i + 2 < len(nodes):
             tri_combo = word + nodes[i+1].surface + nodes[i+2].surface
             if tri_combo in LYRIC_PACK:
@@ -298,7 +308,7 @@ def local_convert(text: str) -> Tuple[str, List[str]]:
                 romaji_parts.append(db_hit)
                 i += 3; continue
 
-        # Try gluing 2 parts: A + B (e.g. En+Sou)
+        # 2-LEVEL GLUE
         if i + 1 < len(nodes):
             duo_combo = word + nodes[i+1].surface
             if duo_combo in LYRIC_PACK:
@@ -308,9 +318,8 @@ def local_convert(text: str) -> Tuple[str, List[str]]:
             if db_hit:
                 romaji_parts.append(db_hit)
                 i += 2; continue
-        # --------------------------
 
-        # Particles
+        # PARTICLES
         if node.feature[0] == '助詞':
             if word == 'は': romaji_parts.append('wa')
             elif word == 'へ': romaji_parts.append('e')
@@ -318,12 +327,12 @@ def local_convert(text: str) -> Tuple[str, List[str]]:
             else: romaji_parts.append(kakasi_conv.do(word))
             i += 1; continue
             
-        # Lyric Pack
+        # LYRIC PACK
         if word in LYRIC_PACK:
             romaji_parts.append(LYRIC_PACK[word])
             i += 1; continue
 
-        # DB Check
+        # DATABASE
         db_romaji = get_static_romaji(word)
         mecab_raw = node.feature[7] if len(node.feature) > 7 and node.feature[7] != '*' else word
         mecab_romaji = kakasi_conv.do(mecab_raw).strip()
@@ -355,9 +364,9 @@ async def call_ai(client, model_id, prompt):
         return json.loads(resp.choices[0].message.content)
     except: return None
 
-async def process_text_glue(text: str) -> Dict:
+async def process_text_status(text: str) -> Dict:
     start = time.perf_counter()
-    cache_key = f"glue_v30:{hashlib.md5(text.encode()).hexdigest()}"
+    cache_key = f"stat_v31:{hashlib.md5(text.encode()).hexdigest()}"
     
     if cache_key in l1_cache: return l1_cache[cache_key]
     if redis_client:
@@ -369,7 +378,6 @@ async def process_text_glue(text: str) -> Dict:
     method = "local_db"
     official_match = False
     
-    # 1. LYRIC SEARCH
     async with aiohttp.ClientSession() as session:
         official = await LyricSearchEngine.find_official_line(session, text)
         if official:
@@ -378,7 +386,6 @@ async def process_text_glue(text: str) -> Dict:
             method = "official_match"
             official_match = True
     
-    # 2. AI REFINEMENT
     if (research_needs and not official_match) and MODELS["deepseek"]["client"]:
         prompt = f"Task: Fix Romaji.\nJP: {text}\nDraft: {draft}\nAttention: {', '.join(research_needs)}\nRules: wa/wo/e particles.\nJSON: {{'corrected': 'string'}}"
         data = await call_ai(MODELS["deepseek"]["client"], MODELS["deepseek"]["id"], prompt)
@@ -390,7 +397,8 @@ async def process_text_glue(text: str) -> Dict:
         "original": text,
         "romaji": re.sub(r'\s+', ' ', final_romaji).strip(),
         "method": method,
-        "trace": f"Official:{official_match}, DB_Size:{check_db_status()}",
+        "sys_status": BUILD_STATUS,
+        "trace": f"DB:{check_db_status()}",
         "time": round(time.perf_counter()-start, 4)
     }
     
@@ -401,18 +409,18 @@ async def process_text_glue(text: str) -> Dict:
 @app.get("/convert")
 async def convert(text: str):
     if not text: raise HTTPException(400)
-    return await process_text_glue(text)
+    return await process_text_status(text)
 
 @app.post("/convert-batch")
 async def convert_batch(lines: List[str]):
-    return await asyncio.gather(*[process_text_glue(l) for l in lines])
+    return await asyncio.gather(*[process_text_status(l) for l in lines])
 
 @app.post("/force-rebuild")
 async def force_rebuild(secret: str):
     if secret != ADMIN_SECRET: raise HTTPException(403)
     if os.path.exists(DB_FILE): os.remove(DB_FILE)
     asyncio.create_task(background_builder())
-    return {"status": "Background Rebuild Started"}
+    return {"status": "Rebuild Triggered"}
 
 @app.post("/clear-cache")
 async def clear_cache(secret: str):
@@ -424,7 +432,7 @@ async def clear_cache(secret: str):
 
 @app.get("/")
 def root():
-    return {"status": "HYPER_GLUE_ONLINE", "db_size": check_db_status()}
+    return {"status": BUILD_STATUS, "db_words": check_db_status()}
 
 if __name__ == "__main__":
     import uvicorn
